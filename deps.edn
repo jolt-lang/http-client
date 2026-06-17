@@ -8,7 +8,7 @@
         {:git/url "https://github.com/clj-commons/clj-http-lite"
          :git/sha "5bc2a98969b4926d090787baf9297fd73cea42d0"}}
 
- :aliases {:test {:extra-paths ["test"]
-                  :main-opts ["-m" "jolt.http-client-test"]}}
-
- :tasks {test "jolt-deps -M:test"}}
+ ;; Tests run clj-http-lite's own suite under Jolt via a Janet driver that stands
+ ;; up in-process plaintext + TLS servers. Needs a jolt checkout (JOLT_REPO) and a
+ ;; clj-http-lite checkout (CLJ_HTTP_LITE, default ../clj-http-lite).
+ :tasks {test "janet test/run-suite.janet"}}
