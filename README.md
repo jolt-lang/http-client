@@ -26,30 +26,32 @@ map.
 
 | clj-http-lite uses | Jolt shim |
 | --- | --- |
-| `java.net.URL`, `HttpURLConnection` | hand-rolled HTTP/1.1 client over Janet `net/` sockets (`jolt.http.platform`) |
-| `java.io.ByteArrayInput/OutputStream` | byte-stream tables wired into `io/copy` / `slurp` |
-| `java.util.zip` (gzip/deflate) | the system **libz** via Janet FFI (`jolt.http.zlib`) |
-| `javax.net.ssl` (https, `insecure?`) | the system **OpenSSL** via Janet FFI, memory-BIO so TLS rides the ev loop (`jolt.http.tls`) |
+| `java.net.URL`, `HttpURLConnection` | hand-rolled HTTP/1.1 client over BSD sockets via `jolt.ffi` (`jolt.http.net` / `jolt.http.platform`) |
+| `java.io.ByteArrayInput/OutputStream` | byte-stream tagged-tables wired into `io/copy` / `slurp` |
+| `java.util.zip` (gzip/deflate) | the system **libz** via `jolt.ffi` (`jolt.http.zlib`) |
+| `javax.net.ssl` (https, `insecure?`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the socket (`jolt.http.tls`) |
 
-libz and OpenSSL are loaded lazily — nothing native is touched until a request
-actually needs gzip or TLS.
+The native libraries (libc sockets, libz, OpenSSL) are declared in `deps.edn`
+under `:jolt/native`; jolt loads them before the namespaces are required.
 
 ## Requirements
 
-- A `jolt` build new enough to expose `__register-instance-check!` and to unwrap
-  the throw envelope in compiled `catch` (both landed alongside this library).
 - System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
+- A `jolt` build with the library-shim host hooks (`__register-class-methods!` /
+  `__register-instance-check!`) and the FFI byte-buffer / charset support this
+  library relies on.
 
 ## Tests
 
-`test/run-suite.janet` runs clj-http-lite's own `client`, `links` and
-`integration` test suites under Jolt, standing up in-process plaintext and TLS
-servers in place of the suite's Jetty subprocess:
+`joltc -M:test` runs clj-http-lite's own `client`, `links` and `integration`
+suites under Jolt. The suites are vendored under `test/clj_http/lite`; their
+`server-process` fixture is replaced with in-process plaintext + TLS servers
+(`jolt.http.test-server`, over `jolt.ffi` sockets + OpenSSL) in place of the
+suite's Jetty subprocess — no external checkout needed.
 
 ```
-JOLT_REPO=../jolt CLJ_HTTP_LITE=../clj-http-lite janet test/run-suite.janet
+joltc -M:test
 ```
 
-All of `links-test` and `integration-test` pass (including the self-signed-cert
-TLS test); `client-test` passes except one assertion that depends on small-map
-*insertion* order, which Jolt (Janet structs, key-sorted) does not preserve.
+All 60 tests pass (116 assertions), including the self-signed-cert TLS test and
+the gzip/deflate decompression tests.
