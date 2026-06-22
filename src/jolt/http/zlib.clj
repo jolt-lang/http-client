@@ -1,16 +1,18 @@
 (ns jolt.http.zlib
-  "gzip / zlib / raw-deflate over the system libz, via Jolt's Janet FFI bridge.
-  Backs the java.util.zip stream shims clj-http-lite uses for content-encoding.
+  "gzip / zlib / raw-deflate over the system libz, bound through jolt.ffi. Backs
+  the java.util.zip stream shims clj-http-lite uses for content-encoding.
 
   Window-bits convention (zlib inflateInit2/deflateInit2):
     15  -> zlib format (java.util.zip default)   31 -> gzip (15+16)
     47  -> auto-detect zlib/gzip on inflate       -15 -> raw, no header
 
-  All FFI handles/signatures are created lazily and held in an atom — never
-  module-level values (ffi handles are unmarshalable; an app baking this lib into
-  a native image would otherwise fail).")
+  libz is declared in deps.edn (:jolt/native) and loaded before this namespace is
+  required, so the foreign-fn bindings resolve at load. Payloads are jolt
+  byte-arrays in and out — the same carrier clj-http-lite's util.clj uses."
+  (:require [jolt.ffi :as ffi]))
 
-(def ^:private ZS 112)            ;; sizeof(z_stream) on LP64
+;; z_stream layout (LP64): the four fields the pump drives, by byte offset.
+(def ^:private ZS 112)            ;; sizeof(z_stream)
 (def ^:private O-next-in 0)
 (def ^:private O-avail-in 8)
 (def ^:private O-next-out 24)
@@ -20,80 +22,74 @@
 (def ^:private Z-FINISH 4)
 (def ^:private Z-NO-FLUSH 0)
 
-(def ^:private state (atom nil))
+(ffi/defcfn c-zlib-version "zlibVersion"   [] :pointer)
+(ffi/defcfn c-deflate-init "deflateInit2_" [:pointer :int :int :int :int :int :pointer :int] :int)
+(ffi/defcfn c-deflate      "deflate"       [:pointer :int] :int)
+(ffi/defcfn c-deflate-end  "deflateEnd"    [:pointer] :int)
+(ffi/defcfn c-inflate-init "inflateInit2_" [:pointer :int :pointer :int] :int)
+(ffi/defcfn c-inflate      "inflate"       [:pointer :int] :int)
+(ffi/defcfn c-inflate-end  "inflateEnd"    [:pointer] :int)
 
-(defn- load! []
-  (or @state
-      (let [libz (or (try (janet.ffi/native "/usr/lib/libz.dylib") (catch Throwable _ nil))
-                     (try (janet.ffi/native "/opt/homebrew/lib/libz.dylib") (catch Throwable _ nil))
-                     (try (janet.ffi/native "libz.so.1") (catch Throwable _ nil))
-                     (try (janet.ffi/native "libz.so") (catch Throwable _ nil))
-                     (throw (ex-info "zlib: could not load libz (gzip/deflate unavailable)" {})))
-            look (fn [n] (janet.ffi/lookup libz n))
-            s {:deflateInit2_ (look "deflateInit2_")
-               :deflate       (look "deflate")
-               :deflateEnd    (look "deflateEnd")
-               :inflateInit2_ (look "inflateInit2_")
-               :inflate       (look "inflate")
-               :inflateEnd    (look "inflateEnd")
-               :ver           (janet.ffi/call (look "zlibVersion") (janet.ffi/signature :default :ptr))
-               :sig-di   (janet.ffi/signature :default :int :ptr :int :int :int :int :int :ptr :int)
-               :sig-ii   (janet.ffi/signature :default :int :ptr :int :ptr :int)
-               :sig-pump (janet.ffi/signature :default :int :ptr :int)
-               :sig-end  (janet.ffi/signature :default :int :ptr)}]
-        (reset! state s)
-        s)))
+;; Lay out a zeroed z_stream pointed at `src` (a byte-array) copied into foreign
+;; memory; return [strm src-buf out-buf]. The caller frees all three.
+(defn- setup [src]
+  (let [n (alength src)
+        strm    (ffi/alloc ZS)
+        src-buf (ffi/alloc (max 1 n))
+        out-buf (ffi/alloc CHUNK)]
+    (dotimes [i ZS] (ffi/write strm :uint8 i 0))
+    (ffi/write-array src-buf src)
+    (ffi/write strm :pointer O-next-in src-buf)
+    (ffi/write strm :uint O-avail-in n)
+    [strm src-buf out-buf]))
 
 (defn deflate-bytes
-  "Compress `src` into `window-bits` format (15 zlib, 31 gzip, -15 raw)."
+  "Compress byte-array `src` into `window-bits` format (15 zlib, 31 gzip, -15 raw)."
   [src window-bits]
-  (let [{:keys [deflateInit2_ deflate deflateEnd ver sig-di sig-pump sig-end]} (load!)
-        src (janet/string src)
-        strm (janet.buffer/new-filled ZS 0)]
-    (janet.ffi/write :ptr src strm O-next-in)
-    (janet.ffi/write :u32 (janet/length src) strm O-avail-in)
-    (when-not (zero? (janet.ffi/call deflateInit2_ sig-di strm 6 8 window-bits 8 0 ver ZS))
-      (throw (ex-info "zlib: deflateInit2 failed" {})))
-    (let [out (janet/buffer "")
-          chunk (janet.buffer/new-filled CHUNK 0)]
-      (loop []
-        (janet.ffi/write :ptr chunk strm O-next-out)
-        (janet.ffi/write :u32 CHUNK strm O-avail-out)
-        (let [r (janet.ffi/call deflate sig-pump strm Z-FINISH)
-              produced (- CHUNK (janet.ffi/read :u32 strm O-avail-out))]
-          (when (pos? produced) (janet.buffer/push out (janet.buffer/slice chunk 0 produced)))
-          (when (neg? r) (janet.ffi/call deflateEnd sig-end strm) (throw (ex-info "zlib: deflate failed" {:rc r})))
-          (when-not (= r Z-STREAM-END) (recur))))
-      (janet.ffi/call deflateEnd sig-end strm)
-      out)))
+  (let [[strm src-buf out-buf] (setup src)]
+    (try
+      (when-not (zero? (c-deflate-init strm 6 8 window-bits 8 0 (c-zlib-version) ZS))
+        (throw (ex-info "zlib: deflateInit2 failed" {})))
+      (let [chunks
+            (loop [acc []]
+              (ffi/write strm :pointer O-next-out out-buf)
+              (ffi/write strm :uint O-avail-out CHUNK)
+              (let [r (c-deflate strm Z-FINISH)
+                    produced (- CHUNK (ffi/read strm :uint O-avail-out))
+                    acc (if (pos? produced) (conj acc (ffi/read-array out-buf produced)) acc)]
+                (cond
+                  (neg? r) (do (c-deflate-end strm) (throw (ex-info "zlib: deflate failed" {:rc r})))
+                  (= r Z-STREAM-END) acc
+                  :else (recur acc))))]
+        (c-deflate-end strm)
+        (byte-array (mapcat seq chunks)))
+      (finally (ffi/free strm) (ffi/free src-buf) (ffi/free out-buf)))))
 
 (defn inflate-bytes
-  "Decompress `src` read in `window-bits` format (15 zlib, 47 auto, -15 raw)."
+  "Decompress byte-array `src` read in `window-bits` format (15 zlib, 47 auto, -15 raw)."
   [src window-bits]
-  (let [{:keys [inflateInit2_ inflate inflateEnd ver sig-ii sig-pump sig-end]} (load!)
-        src (janet/string src)
-        strm (janet.buffer/new-filled ZS 0)]
-    (janet.ffi/write :ptr src strm O-next-in)
-    (janet.ffi/write :u32 (janet/length src) strm O-avail-in)
-    (when-not (zero? (janet.ffi/call inflateInit2_ sig-ii strm window-bits ver ZS))
-      (throw (ex-info "zlib: inflateInit2 failed" {})))
-    (let [out (janet/buffer "")
-          chunk (janet.buffer/new-filled CHUNK 0)]
-      (loop []
-        (janet.ffi/write :ptr chunk strm O-next-out)
-        (janet.ffi/write :u32 CHUNK strm O-avail-out)
-        (let [r (janet.ffi/call inflate sig-pump strm Z-NO-FLUSH)
-              produced (- CHUNK (janet.ffi/read :u32 strm O-avail-out))]
-          (when (pos? produced) (janet.buffer/push out (janet.buffer/slice chunk 0 produced)))
-          (cond
-            (= r Z-STREAM-END) nil
-            (neg? r) (do (janet.ffi/call inflateEnd sig-end strm) (throw (ex-info "zlib: inflate failed" {:rc r})))
-            (and (zero? produced) (zero? (janet.ffi/read :u32 strm O-avail-in))) nil
-            :else (recur))))
-      (janet.ffi/call inflateEnd sig-end strm)
-      out)))
+  (let [[strm src-buf out-buf] (setup src)]
+    (try
+      (when-not (zero? (c-inflate-init strm window-bits (c-zlib-version) ZS))
+        (throw (ex-info "zlib: inflateInit2 failed" {})))
+      (let [chunks
+            (loop [acc []]
+              (ffi/write strm :pointer O-next-out out-buf)
+              (ffi/write strm :uint O-avail-out CHUNK)
+              (let [r (c-inflate strm Z-NO-FLUSH)
+                    produced (- CHUNK (ffi/read strm :uint O-avail-out))
+                    acc (if (pos? produced) (conj acc (ffi/read-array out-buf produced)) acc)]
+                (cond
+                  (= r Z-STREAM-END) acc
+                  (neg? r) (do (c-inflate-end strm) (throw (ex-info "zlib: inflate failed" {:rc r})))
+                  ;; no output and no input left to consume — done.
+                  (and (zero? produced) (zero? (ffi/read strm :uint O-avail-in))) acc
+                  :else (recur acc))))]
+        (c-inflate-end strm)
+        (byte-array (mapcat seq chunks)))
+      (finally (ffi/free strm) (ffi/free src-buf) (ffi/free out-buf)))))
 
-(defn gzip [src] (deflate-bytes src 31))
-(defn gunzip [src] (inflate-bytes src 47))
+(defn gzip         [src] (deflate-bytes src 31))
+(defn gunzip       [src] (inflate-bytes src 47))
 (defn zlib-deflate [src] (deflate-bytes src 15))
 (defn zlib-inflate [src] (inflate-bytes src 15))
