@@ -1,7 +1,7 @@
 (ns jolt.http-client
   "HTTP client for Jolt — clj-http-lite with Jolt platform support installed
-  (java.net.HttpURLConnection / URL over Janet sockets, TLS via OpenSSL FFI,
-  gzip/deflate via libz FFI). Require this namespace and use the functions below
+  (java.net.HttpURLConnection / URL over jolt.ffi BSD sockets, TLS via OpenSSL,
+  gzip/deflate via libz). Require this namespace and use the functions below
   exactly like clj-http.lite.client.
 
       (require '[jolt.http-client :as http])
