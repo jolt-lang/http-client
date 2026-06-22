@@ -308,7 +308,7 @@
      "close" (fn [self & _]
                (let [target (tget self :target)
                      gz (zlib/gzip (byte-array (tget self :acc)))]
-                 ((tget target :write) target gz))   ;; append to the target baos
+                 (.write target gz))   ;; append the gzipped payload to the target baos
                nil)})
 
   ;; java.net.URL (full parser; superset of core's file:-only shim)

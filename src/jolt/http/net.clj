@@ -90,12 +90,16 @@
 (def ^:private bufsize 65536)
 
 (defn recv-bytes
-  "Read up to one bufferful from `fd`; return a byte-array, or nil at EOF/timeout."
+  "Read up to one bufferful from `fd`: a byte-array, nil at EOF (recv 0), or a
+  thrown SocketTimeoutException if a read timeout (SO_RCVTIMEO) elapsed (recv -1)."
   [fd]
   (let [buf (ffi/alloc bufsize)]
     (try
       (let [got (c-recv fd buf bufsize 0)]
-        (when (pos? got) (ffi/read-array buf got)))
+        (cond
+          (pos? got) (ffi/read-array buf got)
+          (zero? got) nil
+          :else (conn-ex "java.net.SocketTimeoutException" "Read timed out")))
       (finally (ffi/free buf)))))
 
 (defn send-bytes
