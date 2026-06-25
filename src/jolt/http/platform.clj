@@ -10,6 +10,7 @@
   (libz). Shim objects are host tagged-tables; their fields are read/written with
   jolt.host/ref-get / ref-put!."
   (:require [clojure.string :as str]
+            [jolt.crypto]                ;; java.security.SecureRandom (real, RAND_bytes)
             [jolt.http.net :as net]
             [jolt.http.zlib :as zlib]
             [jolt.http.tls :as tls]))
@@ -391,8 +392,7 @@
   (__register-class-methods! :jolt/ssl-context
     {"init" (fn [self & _] self)
      "getSocketFactory" (fn [self] (tt :jolt/ssl-socket-factory))})
-  (doseq [nm ["SecureRandom" "java.security.SecureRandom"]]
-    (__register-class-ctor! nm (fn [& _] (tt :jolt/secure-random))))
+  ;; java.security.SecureRandom comes from jolt-crypto (real RAND_bytes), required above.
   ;; TrustManager used as a bare value: (into-array TrustManager [...]).
   (__register-class-ctor! "TrustManager" (fn [& _] nil))
 

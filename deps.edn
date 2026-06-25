@@ -4,24 +4,23 @@
  ;; dependency it declares; this library supplies the JVM host APIs clj-http-lite
  ;; needs (HttpURLConnection / URL / java.util.zip / javax.net.ssl) as Jolt host
  ;; shims, plus TLS (OpenSSL) and gzip (libz) through jolt.ffi.
+ ;; clj-http-lite straight from git; jolt-lang/jolt-crypto carries the OpenSSL
+ ;; (libssl/libcrypto) declarations + the java.security.SecureRandom shim TLS
+ ;; needs — so this library and the ring adapter don't each redeclare them
+ ;; (jolt.deps reconciles to one load).
  :deps {org.clj-commons/clj-http-lite
         {:git/url "https://github.com/clj-commons/clj-http-lite"
-         :git/sha "5bc2a98969b4926d090787baf9297fd73cea42d0"}}
+         :git/sha "5bc2a98969b4926d090787baf9297fd73cea42d0"}
+        jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
+                               :git/sha "0adae49db6064180374ffdcfc72b5b9ac01888cd"}}
 
- ;; System libraries the platform binds through jolt.ffi, loaded before the
- ;; namespaces are required so the foreign-fn bindings resolve. libc supplies the
- ;; BSD sockets (the running process's own symbols); libz is always present;
- ;; OpenSSL (libssl/libcrypto) is needed for https.
+ ;; libc (BSD sockets, the running process's symbols) and libz (gzip); libssl/
+ ;; libcrypto come from jolt-crypto, loaded before these namespaces so the
+ ;; foreign-fn bindings in jolt.http.tls resolve.
  :jolt/native [{:name "libc (POSIX sockets)" :process true}
                {:name "z"
                 :darwin ["libz.dylib" "/usr/lib/libz.dylib"]
-                :linux  ["libz.so.1" "libz.so"]}
-               {:name "ssl"
-                :darwin ["/opt/homebrew/opt/openssl@3/lib/libssl.dylib" "/usr/lib/libssl.dylib" "libssl.dylib"]
-                :linux  ["libssl.so.3" "libssl.so.1.1" "libssl.so"]}
-               {:name "crypto"
-                :darwin ["/opt/homebrew/opt/openssl@3/lib/libcrypto.dylib" "/usr/lib/libcrypto.dylib" "libcrypto.dylib"]
-                :linux  ["libcrypto.so.3" "libcrypto.so.1.1" "libcrypto.so"]}]
+                :linux  ["libz.so.1" "libz.so"]}]
 
  ;; Tests run clj-http-lite's own client/links/integration suites under Jolt, with
  ;; in-process plaintext + TLS servers in place of the suite's Jetty subprocess.
