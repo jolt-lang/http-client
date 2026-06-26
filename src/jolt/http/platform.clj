@@ -392,6 +392,75 @@
   (__register-class-methods! :jolt/ssl-context
     {"init" (fn [self & _] self)
      "getSocketFactory" (fn [self] (tt :jolt/ssl-socket-factory))})
+  ;; --- java.net.http (JDK 11+ HttpClient) -----------------------------------
+  ;; Construction + getters for the cognitect aws-api java backend (and any lib on
+  ;; the modern client). The conformance tests build clients/requests and read them
+  ;; back; live sends are not covered here (sendAsync needs CompletableFuture).
+  (doseq [nm ["HttpClient$Redirect" "java.net.http.HttpClient$Redirect"]]
+    (__register-class-statics! nm {"NEVER" :jolt.http.redirect/NEVER
+                                   "ALWAYS" :jolt.http.redirect/ALWAYS
+                                   "NORMAL" :jolt.http.redirect/NORMAL}))
+  (doseq [nm ["HttpClient$Version" "java.net.http.HttpClient$Version"]]
+    (__register-class-statics! nm {"HTTP_1_1" :jolt.http.version/HTTP_1_1
+                                   "HTTP_2" :jolt.http.version/HTTP_2}))
+  (doseq [nm ["HttpClient" "java.net.http.HttpClient"]]
+    (__register-class-statics! nm {"newBuilder" (fn [& _] (tt :jolt.http/client-builder))
+                                   "newHttpClient" (fn [& _] (tt :jolt.http/client))}))
+  (__register-class-methods! :jolt.http/client-builder
+    {"connectTimeout"  (fn [self d] (tput! self :connect-timeout d) self)
+     "followRedirects" (fn [self r] (tput! self :follow-redirects r) self)
+     "version"         (fn [self v] (tput! self :version v) self)
+     "build"           (fn [self] (doto (tt :jolt.http/client)
+                                    (tput! :connect-timeout (tget self :connect-timeout))
+                                    (tput! :follow-redirects (tget self :follow-redirects))
+                                    (tput! :version (tget self :version))))})
+  (__register-class-methods! :jolt.http/client
+    {"connectTimeout"  (fn [self] (let [d (tget self :connect-timeout)]
+                                    (if d (java.util.Optional/of d) (java.util.Optional/empty))))
+     "followRedirects" (fn [self] (tget self :follow-redirects))
+     "version"         (fn [self] (tget self :version))
+     "send"            (fn [& _] (throw (ex-info "java.net.http live send not implemented in this shim" {})))
+     "sendAsync"       (fn [& _] (throw (ex-info "java.net.http live sendAsync not implemented in this shim" {})))})
+  (doseq [nm ["HttpRequest" "java.net.http.HttpRequest"]]
+    (__register-class-statics! nm {"newBuilder" (fn [& _] (doto (tt :jolt.http/request-builder) (tput! :headers [])))}))
+  (__register-class-methods! :jolt.http/request-builder
+    {"uri"     (fn [self uri] (tput! self :uri uri) self)
+     "method"  (fn [self m _bp] (tput! self :method (str m)) self)
+     "GET"     (fn [self] (tput! self :method "GET") self)
+     "POST"    (fn [self _bp] (tput! self :method "POST") self)
+     "PUT"     (fn [self _bp] (tput! self :method "PUT") self)
+     "DELETE"  (fn [self] (tput! self :method "DELETE") self)
+     "header"  (fn [self k v] (tput! self :headers (conj (tget self :headers) [(str k) (str v)])) self)
+     "timeout" (fn [self d] (tput! self :timeout d) self)
+     "build"   (fn [self] (doto (tt :jolt.http/request)
+                            (tput! :uri (tget self :uri))
+                            (tput! :method (or (tget self :method) "GET"))
+                            (tput! :timeout (tget self :timeout))
+                            (tput! :headers (tget self :headers))))})
+  (__register-class-methods! :jolt.http/request
+    {"uri"     (fn [self] (tget self :uri))
+     "method"  (fn [self] (tget self :method))
+     "timeout" (fn [self] (let [d (tget self :timeout)]
+                            (if d (java.util.Optional/of d) (java.util.Optional/empty))))
+     "headers" (fn [self] (doto (tt :jolt.http/headers) (tput! :pairs (tget self :headers))))})
+  ;; HttpHeaders.map() groups to {name [values]} (java.net.http always vectors values).
+  (__register-class-methods! :jolt.http/headers
+    {"map" (fn [self] (reduce (fn [m [k v]] (update m k (fnil conj []) v)) {} (tget self :pairs)))
+     "firstValue" (fn [self k] (if-let [p (first (filter #(= k (first %)) (tget self :pairs)))]
+                                 (java.util.Optional/of (second p)) (java.util.Optional/empty)))})
+  (doseq [nm ["HttpRequest$BodyPublishers" "java.net.http.HttpRequest$BodyPublishers"]]
+    (__register-class-statics! nm {"noBody"      (fn [& _] (tt :jolt.http/body-empty))
+                                   "ofByteArray" (fn [ba & _] (doto (tt :jolt.http/body-bytes) (tput! :bytes (byte-array ba))))
+                                   "ofString"    (fn [s & _] (doto (tt :jolt.http/body-bytes) (tput! :bytes (->bytes (str s)))))}))
+  (doseq [nm ["HttpResponse$BodyHandlers" "java.net.http.HttpResponse$BodyHandlers"]]
+    (__register-class-statics! nm {"ofByteArray" (fn [& _] :jolt.http/handler-bytes)
+                                   "ofString"    (fn [& _] :jolt.http/handler-string)}))
+  (__register-class-methods! :jolt.http/response
+    {"statusCode" (fn [self] (tget self :status))
+     "body"       (fn [self] (tget self :body))
+     "uri"        (fn [self] (tget self :uri))
+     "headers"    (fn [self] (doto (tt :jolt.http/headers) (tput! :pairs (tget self :resp-headers))))})
+
   ;; java.security.SecureRandom comes from jolt-crypto (real RAND_bytes), required above.
   ;; TrustManager used as a bare value: (into-array TrustManager [...]).
   (__register-class-ctor! "TrustManager" (fn [& _] nil))

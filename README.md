@@ -30,6 +30,7 @@ map.
 | `java.io.ByteArrayInput/OutputStream` | byte-stream tagged-tables wired into `io/copy` / `slurp` |
 | `java.util.zip` (gzip/deflate) | the system **libz** via `jolt.ffi` (`jolt.http.zlib`) |
 | `javax.net.ssl` (https, `insecure?`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the socket (`jolt.http.tls`) |
+| `java.net.http.HttpClient` (JDK 11+ client) | construction + getters for the modern client/request builders (`HttpClient`/`HttpRequest`/`HttpResponse` + `BodyPublishers`/`BodyHandlers`/`HttpHeaders`); used by cognitect aws-api's java backend. Live sends not yet wired (no `CompletableFuture`). |
 
 The native libraries (libc sockets, libz, OpenSSL) are declared in `deps.edn`
 under `:jolt/native`; jolt loads them before the namespaces are required.
