@@ -21,12 +21,10 @@
 (defn- tput! [t k v] (jolt.host/ref-put! t k v))
 (defn- table? [x] (jolt.host/table? x))
 
-;; A throwable table carrying a JVM :class name; core's core-class reads :class,
-;; so (class e) / catch / clojure.test thrown? match by class.
+;; A typed throwable carrying a JVM class name, so (class e) / catch / thrown?
+;; match by class AND .getMessage/ex-message return the message.
 (defn- throw-typed [class msg]
-  (let [t (tt :jolt/ex-info)]
-    (tput! t :class class) (tput! t :message (str msg)) (tput! t :data {})
-    (throw t)))
+  (throw (jolt.host/throwable class (str msg))))
 
 ;; --- byte coercion ---------------------------------------------------------
 ;; bytes flow as jolt byte-arrays. Coerce a stream shim / string / bytevector to
@@ -232,6 +230,36 @@
   (when-not (tget conn :performed) (perform! conn))
   (tget conn :response))
 
+;; Perform a java.net.http request synchronously over the same socket/TLS layer
+;; clj-http-lite uses, returning a :jolt.http/response. This is what wires the
+;; java.net.http shim's send/sendAsync to a real request.
+(defn- net-http-send [request handler]
+  (let [url     (parse-url (str (tget request :uri)))
+        method  (or (tget request :method) "GET")
+        headers (or (tget request :headers) [])
+        body    (when-let [bp (tget request :body)] (tget bp :bytes))
+        https?  (= "https" (tget url :protocol))
+        stream  (connect-stream (tget url :host) (effective-port url) https? false 30000)
+        resp    (try
+                  (s-write stream (build-request method url headers body))
+                  (parse-response (recv-all stream))
+                  (finally (try (s-close stream) (catch Throwable _ nil))))
+        ;; BodyHandlers.ofString hands the body back as a String; ofByteArray (the
+        ;; default the aws backend uses) as the raw byte[].
+        body-bytes (:body resp)
+        out-body (if (= handler :jolt.http/handler-string)
+                   (String. ^bytes body-bytes "UTF-8") body-bytes)]
+    (doto (tt :jolt.http/response)
+      (tput! :status (:status resp))
+      (tput! :body out-body)
+      (tput! :uri (tget request :uri))
+      (tput! :resp-headers (:header-pairs resp)))))
+
+;; A settled CompletableFuture: the request ran synchronously, so the future
+;; already holds a value or an error. thenApply/exceptionally apply immediately.
+(defn- settled-future [value error]
+  (doto (tt :jolt.http/future) (tput! :value value) (tput! :error error)))
+
 (defn- open-connection [url]
   (let [c (tt :jolt/http-url-connection)]
     (tput! c :url url)
@@ -419,16 +447,29 @@
                                     (if d (java.util.Optional/of d) (java.util.Optional/empty))))
      "followRedirects" (fn [self] (tget self :follow-redirects))
      "version"         (fn [self] (tget self :version))
-     "send"            (fn [& _] (throw (ex-info "java.net.http live send not implemented in this shim" {})))
-     "sendAsync"       (fn [& _] (throw (ex-info "java.net.http live sendAsync not implemented in this shim" {})))})
+     ;; live send over the socket/TLS layer. send is synchronous; sendAsync runs
+     ;; the same request and hands back an already-settled future (thenApply /
+     ;; exceptionally apply at once) — enough for the cognitect aws-api flow, which
+     ;; does (.sendAsync client req handler) then .thenApply/.exceptionally.
+     "send"            (fn [self req handler] (net-http-send req handler))
+     "sendAsync"       (fn [self req handler]
+                         (try (settled-future (net-http-send req handler) nil)
+                              (catch Throwable e (settled-future nil e))))})
+  (__register-class-methods! :jolt.http/future
+    {"thenApply"     (fn [self f] (if (tget self :error) self
+                                    (settled-future (.apply f (tget self :value)) nil)))
+     "exceptionally" (fn [self f] (if-let [e (tget self :error)]
+                                    (settled-future (.apply f e) nil) self))
+     "get"           (fn [self] (if-let [e (tget self :error)] (throw e) (tget self :value)))
+     "join"          (fn [self] (if-let [e (tget self :error)] (throw e) (tget self :value)))})
   (doseq [nm ["HttpRequest" "java.net.http.HttpRequest"]]
     (__register-class-statics! nm {"newBuilder" (fn [& _] (doto (tt :jolt.http/request-builder) (tput! :headers [])))}))
   (__register-class-methods! :jolt.http/request-builder
     {"uri"     (fn [self uri] (tput! self :uri uri) self)
-     "method"  (fn [self m _bp] (tput! self :method (str m)) self)
+     "method"  (fn [self m bp] (tput! self :method (str m)) (tput! self :body bp) self)
      "GET"     (fn [self] (tput! self :method "GET") self)
-     "POST"    (fn [self _bp] (tput! self :method "POST") self)
-     "PUT"     (fn [self _bp] (tput! self :method "PUT") self)
+     "POST"    (fn [self bp] (tput! self :method "POST") (tput! self :body bp) self)
+     "PUT"     (fn [self bp] (tput! self :method "PUT") (tput! self :body bp) self)
      "DELETE"  (fn [self] (tput! self :method "DELETE") self)
      "header"  (fn [self k v] (tput! self :headers (conj (tget self :headers) [(str k) (str v)])) self)
      "timeout" (fn [self d] (tput! self :timeout d) self)
@@ -436,7 +477,8 @@
                             (tput! :uri (tget self :uri))
                             (tput! :method (or (tget self :method) "GET"))
                             (tput! :timeout (tget self :timeout))
-                            (tput! :headers (tget self :headers))))})
+                            (tput! :headers (tget self :headers))
+                            (tput! :body (tget self :body))))})
   (__register-class-methods! :jolt.http/request
     {"uri"     (fn [self] (tget self :uri))
      "method"  (fn [self] (tget self :method))
