@@ -35,11 +35,9 @@
 (def ^:private so-rcvtimeo (if macos? 0x1006 20))
 
 (defn- conn-ex [class msg]
-  (let [t (jolt.host/tagged-table :jolt/ex-info)]
-    (jolt.host/ref-put! t :class class)
-    (jolt.host/ref-put! t :message (str msg))
-    (jolt.host/ref-put! t :data {})
-    (throw t)))
+  ;; a typed throwable so callers get the right (class e)/instance? AND a working
+  ;; .getMessage/ex-message (the cognitect aws backend reads .getMessage).
+  (throw (jolt.host/throwable class (str msg))))
 
 (defn connect
   "Resolve host:port and open a connected TCP socket; return its fd. Throws a
