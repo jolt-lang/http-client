@@ -28,6 +28,11 @@
                   :main-opts ["-m" "jolt.http.test-runner"]}
            ;; isolated zlib round-trip check (no clj-http-lite / sockets needed)
            :zlibtest {:extra-paths ["test"]
-                      :main-opts ["-m" "jolt.http.zlib-test"]}}
+                      :main-opts ["-m" "jolt.http.zlib-test"]}
+           ;; babashka.http-client compat: it runs on jolt over jolt.http.platform's
+           ;; java.net.http shim. Plaintext in-process server, so no TLS/crypto.
+           :bhctest {:extra-paths ["test"]
+                     :extra-deps {org.babashka/http-client {:mvn/version "0.4.23"}}
+                     :main-opts ["-m" "jolt.http.babashka-test"]}}
 
  :tasks {test "joltc -M:test"}}

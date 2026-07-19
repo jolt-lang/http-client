@@ -245,14 +245,18 @@
                   (parse-response (recv-all stream))
                   (finally (try (s-close stream) (catch Throwable _ nil))))
         ;; BodyHandlers.ofString hands the body back as a String; ofByteArray (the
-        ;; default the aws backend uses) as the raw byte[].
+        ;; aws backend's default) as the raw byte[]; ofInputStream (babashka's) as a
+        ;; ByteArrayInputStream over those bytes.
         body-bytes (:body resp)
-        out-body (if (= handler :jolt.http/handler-string)
-                   (String. ^bytes body-bytes "UTF-8") body-bytes)]
+        out-body (cond
+                   (= handler :jolt.http/handler-string) (String. ^bytes body-bytes "UTF-8")
+                   (= handler :jolt.http/handler-inputstream) (make-bais body-bytes)
+                   :else body-bytes)]
     (doto (tt :jolt.http/response)
       (tput! :status (:status resp))
       (tput! :body out-body)
       (tput! :uri (tget request :uri))
+      (tput! :version (doto (tt :jolt.http/version-enum) (tput! :name "HTTP_1_1")))
       (tput! :resp-headers (:header-pairs resp)))))
 
 ;; A settled CompletableFuture: the request ran synchronously, so the future
@@ -428,9 +432,14 @@
     (__register-class-statics! nm {"NEVER" :jolt.http.redirect/NEVER
                                    "ALWAYS" :jolt.http.redirect/ALWAYS
                                    "NORMAL" :jolt.http.redirect/NORMAL}))
+  ;; HttpClient.Version enum values: a shim carrying the enum name, since babashka's
+  ;; response->map reads (.name (.version resp)) to recover the version keyword.
+  (__register-class-methods! :jolt.http/version-enum
+    {"name" (fn [self] (tget self :name))
+     "toString" (fn [self] (tget self :name))})
   (doseq [nm ["HttpClient$Version" "java.net.http.HttpClient$Version"]]
-    (__register-class-statics! nm {"HTTP_1_1" :jolt.http.version/HTTP_1_1
-                                   "HTTP_2" :jolt.http.version/HTTP_2}))
+    (__register-class-statics! nm {"HTTP_1_1" (doto (tt :jolt.http/version-enum) (tput! :name "HTTP_1_1"))
+                                   "HTTP_2"   (doto (tt :jolt.http/version-enum) (tput! :name "HTTP_2"))}))
   (doseq [nm ["HttpClient" "java.net.http.HttpClient"]]
     (__register-class-statics! nm {"newBuilder" (fn [& _] (tt :jolt.http/client-builder))
                                    "newHttpClient" (fn [& _] (tt :jolt.http/client))}))
@@ -472,6 +481,13 @@
      "PUT"     (fn [self bp] (tput! self :method "PUT") (tput! self :body bp) self)
      "DELETE"  (fn [self] (tput! self :method "DELETE") self)
      "header"  (fn [self k v] (tput! self :headers (conj (tget self :headers) [(str k) (str v)])) self)
+     ;; HttpRequest.Builder.headers(String...): a flat name/value array (babashka
+     ;; passes (into-array String (coerce-headers headers))).
+     "headers" (fn [self arr] (tput! self :headers (into (tget self :headers)
+                                                         (map vec (partition 2 (vec arr)))))
+                 self)
+     "expectContinue" (fn [self _] self)   ; no-op; the socket path doesn't 100-continue
+     "version" (fn [self v] (tput! self :version v) self)
      "timeout" (fn [self d] (tput! self :timeout d) self)
      "build"   (fn [self] (doto (tt :jolt.http/request)
                             (tput! :uri (tget self :uri))
@@ -485,22 +501,37 @@
      "timeout" (fn [self] (let [d (tget self :timeout)]
                             (if d (java.util.Optional/of d) (java.util.Optional/empty))))
      "headers" (fn [self] (doto (tt :jolt.http/headers) (tput! :pairs (tget self :headers))))})
-  ;; HttpHeaders.map() groups to {name [values]} (java.net.http always vectors values).
+  ;; HttpHeaders.map() groups to {name [values]} (java.net.http always vectors
+  ;; values) with LOWERCASED names, like java.net.http — babashka's response->map
+  ;; and callers look keys up lower-case. firstValue matches case-insensitively.
   (__register-class-methods! :jolt.http/headers
-    {"map" (fn [self] (reduce (fn [m [k v]] (update m k (fnil conj []) v)) {} (tget self :pairs)))
-     "firstValue" (fn [self k] (if-let [p (first (filter #(= k (first %)) (tget self :pairs)))]
-                                 (java.util.Optional/of (second p)) (java.util.Optional/empty)))})
+    {"map" (fn [self] (reduce (fn [m [k v]] (update m (str/lower-case k) (fnil conj []) v)) {} (tget self :pairs)))
+     "firstValue" (fn [self k] (let [low (str/lower-case k)]
+                                 (if-let [p (first (filter #(= low (str/lower-case (first %))) (tget self :pairs)))]
+                                   (java.util.Optional/of (second p)) (java.util.Optional/empty))))})
   (doseq [nm ["HttpRequest$BodyPublishers" "java.net.http.HttpRequest$BodyPublishers"]]
     (__register-class-statics! nm {"noBody"      (fn [& _] (tt :jolt.http/body-empty))
                                    "ofByteArray" (fn [ba & _] (doto (tt :jolt.http/body-bytes) (tput! :bytes (byte-array ba))))
-                                   "ofString"    (fn [s & _] (doto (tt :jolt.http/body-bytes) (tput! :bytes (->bytes (str s)))))}))
+                                   "ofString"    (fn [s & _] (doto (tt :jolt.http/body-bytes) (tput! :bytes (->bytes (str s)))))
+                                   ;; ofInputStream takes a Supplier<InputStream>; ofFile a Path.
+                                   ;; Both are read eagerly to a byte[] here (no streaming upload).
+                                   "ofInputStream" (fn [supplier & _]
+                                                     (doto (tt :jolt.http/body-bytes)
+                                                       (tput! :bytes (->bytes (.get supplier)))))
+                                   "ofFile"      (fn [path & _]
+                                                   (doto (tt :jolt.http/body-bytes)
+                                                     (tput! :bytes (->bytes (slurp (str path))))))}))
   (doseq [nm ["HttpResponse$BodyHandlers" "java.net.http.HttpResponse$BodyHandlers"]]
-    (__register-class-statics! nm {"ofByteArray" (fn [& _] :jolt.http/handler-bytes)
-                                   "ofString"    (fn [& _] :jolt.http/handler-string)}))
+    (__register-class-statics! nm {"ofByteArray"   (fn [& _] :jolt.http/handler-bytes)
+                                   "ofString"      (fn [& _] :jolt.http/handler-string)
+                                   "ofInputStream" (fn [& _] :jolt.http/handler-inputstream)}))
   (__register-class-methods! :jolt.http/response
     {"statusCode" (fn [self] (tget self :status))
      "body"       (fn [self] (tget self :body))
      "uri"        (fn [self] (tget self :uri))
+     ;; babashka's response->map reads (.name (.version resp)); the version enum is
+     ;; the same keyword the request/client side uses.
+     "version"    (fn [self] (or (tget self :version) (doto (tt :jolt.http/version-enum) (tput! :name "HTTP_1_1"))))
      "headers"    (fn [self] (doto (tt :jolt.http/headers) (tput! :pairs (tget self :resp-headers))))})
 
   ;; java.security.SecureRandom comes from jolt-crypto (real RAND_bytes), required above.
