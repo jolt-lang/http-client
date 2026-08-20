@@ -26,6 +26,42 @@
 (defn- throw-typed [class msg]
   (throw (jolt.host/throwable class (str msg))))
 
+;; jolt models java.io.ByteArrayInputStream / ByteArrayOutputStream natively.
+;; Where it does, USE ITS OWN and do not register a ctor over it: that override
+;; is PROCESS-WIDE, so every (ByteArrayInputStream. …) in an app that merely
+;; requires this library lands on the shim — including in namespaces with
+;; nothing to do with HTTP. Beyond the surface gaps that keeps reintroducing,
+;; the shim is a tagged table read through a Clojure fn per byte: draining 1 MB
+;; with io/copy measured 1136 ns/byte against 0.34 for the host stream, ~3300x.
+;; The output side is worse in kind — it accumulates into a persistent vector,
+;; one boxed element per byte, so a large upload builds a vector as long as the
+;; body.
+;;
+;; Probed rather than assumed, and probed for the WHOLE surface the shim
+;; provides — read/available/readNBytes/mark/reset/markSupported/transferTo/
+;; readAllBytes and the output side. A host that models these classes but only
+;; part of their behaviour is worse than the shim, because the gap surfaces in
+;; a consumer's code rather than here. jolt gained the last of them in
+;; jolt-lang/jolt#681; on anything older the probe fails and the shims below are
+;; registered exactly as before. This runs at load, before install!, so it
+;; probes the host and not ourselves.
+(def ^:private host-byte-streams?
+  (and (try (let [s (java.io.ByteArrayInputStream. (byte-array [1 2 3 4]))]
+              (and (= 1 (.read s))
+                   (= 3 (.available s))
+                   (= [2] (seq (.readNBytes s 1)))
+                   (do (.mark s 0) (.markSupported s))
+                   (= 3 (.read s))
+                   (do (.reset s) (= 3 (.read s)))
+                   (= 1 (.transferTo s (java.io.ByteArrayOutputStream.)))
+                   (zero? (alength (.readAllBytes s)))))
+            (catch Throwable _ false))
+       (try (let [o (java.io.ByteArrayOutputStream.)]
+              (.write o (byte-array [7 8]) 0 2)
+              (.write o 9)
+              (and (= [7 8 9] (seq (.toByteArray o))) (= 3 (.size o))))
+            (catch Throwable _ false))))
+
 ;; --- byte coercion ---------------------------------------------------------
 ;; bytes flow as jolt byte-arrays. Coerce a stream shim / string / bytevector to
 ;; one; a byte-array passes through.
@@ -35,6 +71,11 @@
       (let [b (tget x :bytes) p (or (tget x :pos) 0)]
         (byte-array (drop p (seq b))))
     (and (table? x) (= :jolt/baos (tget x :jolt/type))) (byte-array (tget x :acc))
+    ;; a real host stream, when jolt models them (see host-byte-streams? below).
+    ;; readAllBytes reads from the CURRENT position, the same as the shim arm's
+    ;; (drop p …).
+    (and host-byte-streams? (instance? java.io.InputStream x)) (.readAllBytes x)
+    (and host-byte-streams? (instance? java.io.ByteArrayOutputStream x)) (.toByteArray x)
     :else (byte-array x)))                       ;; string / bytevector / byte-array
 
 (defn- ba->latin1 [ba] (String. ba "ISO-8859-1"))   ;; byte-array -> string, 1 char/byte
@@ -47,17 +88,21 @@
 
 ;; --- byte streams ----------------------------------------------------------
 (defn make-bais [bytes]
-  (let [t (tt :jolt/bais)]
-    (tput! t :jolt/input-stream true)
-    (tput! t :bytes (byte-array bytes))
-    (tput! t :pos 0)
-    t))
+  (if host-byte-streams?
+    (java.io.ByteArrayInputStream. (byte-array bytes))
+    (let [t (tt :jolt/bais)]
+      (tput! t :jolt/input-stream true)
+      (tput! t :bytes (byte-array bytes))
+      (tput! t :pos 0)
+      t)))
 
 (defn make-baos []
-  (let [t (tt :jolt/baos)]
-    (tput! t :jolt/output-stream true)
-    (tput! t :acc [])
-    t))
+  (if host-byte-streams?
+    (java.io.ByteArrayOutputStream.)
+    (let [t (tt :jolt/baos)]
+      (tput! t :jolt/output-stream true)
+      (tput! t :acc [])
+      t)))
 
 ;; --- URL -------------------------------------------------------------------
 (defn- min-idx [s chars]
@@ -320,11 +365,15 @@
 
 ;; --- install ---------------------------------------------------------------
 (defn install! []
-  ;; ByteArrayInputStream / ByteArrayOutputStream
-  (doseq [nm ["ByteArrayInputStream" "java.io.ByteArrayInputStream"]]
-    (__register-class-ctor! nm (fn [bytes & _] (make-bais bytes))))
-  (doseq [nm ["ByteArrayOutputStream" "java.io.ByteArrayOutputStream"]]
-    (__register-class-ctor! nm (fn [& _] (make-baos))))
+  ;; ByteArrayInputStream / ByteArrayOutputStream — only when the host has none
+  ;; of its own. Replacing a class jolt models costs every namespace in the
+  ;; process (see host-byte-streams?); make-bais/make-baos hand back the host's
+  ;; streams there, so clj-http-lite and our own shims get them either way.
+  (when-not host-byte-streams?
+    (doseq [nm ["ByteArrayInputStream" "java.io.ByteArrayInputStream"]]
+      (__register-class-ctor! nm (fn [bytes & _] (make-bais bytes))))
+    (doseq [nm ["ByteArrayOutputStream" "java.io.ByteArrayOutputStream"]]
+      (__register-class-ctor! nm (fn [& _] (make-baos)))))
   (__register-class-methods! :jolt/bais
     ;; The no-arg read returns the byte as an UNSIGNED int 0..255, -1 at EOF —
     ;; InputStream.read()'s contract, and the only way a caller can tell 0xff from

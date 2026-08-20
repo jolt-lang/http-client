@@ -1,9 +1,12 @@
 (ns jolt.http.stream-shim-test
-  "The ByteArrayInputStream/ByteArrayOutputStream shims installed by
-  jolt.http.platform replace jolt's own PROCESS-WIDE, so any app that merely
-  requires this library gets them for every (ByteArrayInputStream. …) it writes,
-  HTTP-related or not. They therefore owe the whole InputStream surface, not just
-  what this client calls. Expected values are JVM Clojure's."
+  "Byte-stream behaviour every app that requires this library depends on,
+  whether it gets jolt's own streams or our shims. On a jolt that models
+  java.io.ByteArrayInputStream/ByteArrayOutputStream with the full surface these
+  ARE jolt's — platform.clj deliberately does not register over them, because
+  that override is process-wide and lands on every (ByteArrayInputStream. …) an
+  app writes, HTTP-related or not. On an older jolt they are the shims, which
+  therefore owe the same surface. These assertions must hold either way, and
+  expected values are JVM Clojure's."
   (:require [clojure.test :refer [deftest is testing]]
             [jolt.http.platform])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]))
@@ -67,3 +70,20 @@
           buf (byte-array 2)]
       (is (= 2 (.read s buf 0 2)))
       (is (= [-1 2] (vec buf))))))
+
+
+;; The point of preferring the host's classes: an app that requires this library
+;; must not silently get a substitute for a class jolt already models. A shim
+;; that answers this whole file's assertions is still not the host's stream —
+;; draining one measured ~3300x slower — so assert the identity, not just the
+;; behaviour. Keyed off the decision platform.clj actually made: on a jolt whose
+;; own streams cannot answer the surface the shim IS the right answer, and this
+;; asserts we installed it.
+(deftest prefers-the-host-stream
+  (let [host-streams? @#'jolt.http.platform/host-byte-streams?]
+    (if host-streams?
+      (testing "jolt models them, so no ctor override and these are jolt's own"
+        (is (= "class java.io.InputStream" (str (type (ByteArrayInputStream. (byte-array 1))))))
+        (is (not= "class :object" (str (type (ByteArrayOutputStream.))))))
+      (testing "jolt cannot answer the surface, so the shim stands in"
+        (is (= "class :object" (str (type (ByteArrayInputStream. (byte-array 1))))))))))
