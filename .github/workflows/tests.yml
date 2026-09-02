@@ -1,11 +1,13 @@
 name: tests
 on: [push, pull_request]
 # One pinned jolt, not whatever the latest release happens to be. The supported
-# floor is 0.7.19: jolt.http.net reads errno through jolt.io-poller (which 0.6.8
-# predates), and 0.7.19 is where jolt's own java.io byte streams answer the full
-# surface (readNBytes/transferTo/mark), so jolt.http.platform hands back jolt's
-# classes instead of registering its shims. On older jolts the suite dies at
-# namespace load with "Could not locate jolt/io_poller".
+# floor is 0.8.0, which deps.edn declares as :jolt/min-version: jolt.ffi/write
+# takes the value before the offset from 0.8.0 on, and the two spellings are
+# both integers, so on 0.7.x the zlib path wrote to the wrong place and the
+# compressed-body tests crashed (then the server they left behind held port
+# 18091 and every later suite died on bind). 0.7.19 was the floor before that:
+# jolt.http.net reads errno through jolt.io-poller, and 0.7.19 is where jolt's
+# own java.io byte streams answer the full surface (readNBytes/transferTo/mark).
 #
 # Raise the pin as new jolt releases land.
 
@@ -13,7 +15,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      JOLT_VERSION: '0.7.19'
+      JOLT_VERSION: '0.8.0'
     steps:
       - uses: actions/checkout@v4
       - name: Install jolt
