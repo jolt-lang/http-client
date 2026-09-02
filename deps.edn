@@ -17,7 +17,7 @@
         {:git/url "https://github.com/clj-commons/clj-http-lite"
          :git/sha "5bc2a98969b4926d090787baf9297fd73cea42d0"}
         jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
-                               :git/sha "0adae49db6064180374ffdcfc72b5b9ac01888cd"}}
+                               :git/sha "44da69bad08a2fd7631bd4061e3fb53938dafff6"}}
 
  ;; libc (BSD sockets, the running process's symbols) and libz (gzip); libssl/
  ;; libcrypto come from jolt-crypto, loaded before these namespaces so the
