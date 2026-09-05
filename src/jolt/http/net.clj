@@ -173,14 +173,26 @@
                        fd      (c-socket fam sockt proto)]
                    (cond
                      (neg? fd) (recur (ffi/read ai :pointer O-ai-next) timed-out?)
-                     :else (try
-                             (let [rc (attempt-connect fd addr addrlen timeout-ms)]
-                               (if (= 0 rc)
-                                 fd
-                                 (do (c-close fd)
-                                     (recur (ffi/read ai :pointer O-ai-next)
-                                            (or timed-out? (= :timeout rc))))))
-                             (catch Throwable t (c-close fd) (throw t)))))))
+                     ;; The try covers the CONNECT and nothing else, so the retry
+                     ;; below is an ordinary tail recur. It used to wrap the whole
+                     ;; arm, which put the recur inside a try — a shape Clojure
+                     ;; refuses ("Cannot recur across try") and jolt compiled into
+                     ;; a loop that rebound nothing. jolt refuses it too as of
+                     ;; 0.8.2, so this walk no longer builds there.
+                     ;;
+                     ;; The fd still closes on the way out of a throw, still
+                     ;; closes before the next address is tried, and is still
+                     ;; returned OPEN on success — the only behaviour that changes
+                     ;; is that a c-close raising during the retry path no longer
+                     ;; reaches a handler that closes the same fd a second time.
+                     :else
+                     (let [rc (try (attempt-connect fd addr addrlen timeout-ms)
+                                   (catch Throwable t (c-close fd) (throw t)))]
+                       (if (= 0 rc)
+                         fd
+                         (do (c-close fd)
+                             (recur (ffi/read ai :pointer O-ai-next)
+                                    (or timed-out? (= :timeout rc))))))))))
              (finally (c-freeaddrinfo res)))))
        (finally (ffi/free node) (ffi/free service) (ffi/free respp) (ffi/free hints))))))
 
