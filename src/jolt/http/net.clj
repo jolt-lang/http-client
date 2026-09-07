@@ -53,6 +53,7 @@
 (def ^:private f-getfl 3)
 (def ^:private f-setfl 4)
 (def ^:private o-nonblock (if macos? 0x4 0x800))
+(def ^:private po-pollin 1)
 (def ^:private po-pollout 4)
 
 (defn- conn-ex [class msg]
@@ -217,6 +218,66 @@
 (def ^:private econnreset (if macos? 54 104))
 (def ^:private epipe 32)
 
+(def interrupt-slice-ms
+  "How long one read waits for the socket to become readable before checking
+  whether its thread has been interrupted.
+
+  jolt's Thread.interrupt sets the flag and nothing more: a thread inside a
+  blocking syscall is not signalled, so a `recv` parked on a silent peer ran
+  its whole SO_RCVTIMEO after an interrupt (measured: 4.5 s of a 5 s timeout,
+  and a 5 s `poll` likewise). So `recv-bytes` waits for readability in slices
+  of this length and checks the flag between them, throwing
+  InterruptedException — the same exception an interrupted sleep throws — so
+  a caller that cancels a request gets its thread back within one slice
+  instead of one socket timeout. The socket's read timeout stays the bound
+  on the read as a whole; this only decides how promptly a cancel lands."
+  250)
+
+(defn- read-timeout-ms
+  "The socket's SO_RCVTIMEO in milliseconds, 0 when none is set (or the query
+  fails, which reads as unbounded rather than as a timeout that never was)."
+  [fd]
+  (let [tv (ffi/alloc 16) len (ffi/alloc 4)]
+    (try
+      (dotimes [i 16] (ffi/write tv :uint8 0 i))
+      (ffi/write len :uint 16 0)
+      (if (neg? (c-getsockopt fd sol-socket so-rcvtimeo tv len))
+        0
+        (+ (* 1000 (ffi/read tv :long 0)) (quot (ffi/read tv :long 8) 1000)))
+      (finally (ffi/free tv) (ffi/free len)))))
+
+(defn- await-readable!
+  "Park until `fd` has something to read (or has hung up — recv decides which),
+  in `interrupt-slice-ms` slices. Throws InterruptedException if the thread was
+  interrupted between slices, SocketTimeoutException once the socket's own read
+  timeout has elapsed with nothing to read."
+  [fd]
+  (let [timeout  (read-timeout-ms fd)
+        deadline (when (pos? timeout) (+ (System/currentTimeMillis) timeout))
+        pf       (ffi/alloc 8)]
+    (try
+      ;; struct pollfd, as in timed-connect: events in the low half of the int
+      ;; at offset 4, revents zeroed in the high half.
+      (dotimes [i 8] (ffi/write pf :uint8 0 i))
+      (ffi/write pf :int fd 0)
+      (ffi/write pf :int po-pollin 4)
+      (loop []
+        (when (Thread/interrupted)
+          (conn-ex "java.lang.InterruptedException" "read interrupted"))
+        (let [now   (System/currentTimeMillis)
+              slice (if deadline
+                      (min interrupt-slice-ms (max 0 (- deadline now)))
+                      interrupt-slice-ms)
+              pr    (c-poll pf 1 (int slice))]
+          (cond
+            (pos? pr) nil
+            (and deadline (>= (System/currentTimeMillis) deadline))
+            (conn-ex "java.net.SocketTimeoutException" "Read timed out")
+            (zero? pr) (recur)
+            (= (poller/errno) eintr) (recur)
+            :else (conn-ex "java.io.IOException" "poll failed"))))
+      (finally (ffi/free pf)))))
+
 (defn- recv-err-ex
   "The exception a negative recv deserves, classed by what actually failed:
   EAGAIN is the SO_RCVTIMEO firing (SocketTimeoutException), ECONNRESET/EPIPE
@@ -234,11 +295,15 @@
 
 (defn recv-bytes
   "Read up to one bufferful from `fd`: a byte-array, nil at EOF (recv 0), or a
-  thrown exception classed by errno (see recv-err-ex)."
+  thrown exception classed by errno (see recv-err-ex). Waits for readability
+  in interruptible slices first (await-readable!), so a cancelled caller's
+  thread comes back within `interrupt-slice-ms` rather than after the socket
+  timeout."
   [fd]
   (let [buf (ffi/alloc bufsize)]
     (try
       (loop []
+        (await-readable! fd)
         (let [got (c-recv fd buf bufsize 0)
               err (when (neg? got) (poller/errno))]
           (cond
