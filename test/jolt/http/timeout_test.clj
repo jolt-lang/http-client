@@ -257,3 +257,63 @@
         (is (not (str/includes? (str (class e)) "SocketTimeoutException"))
             "the transport's own exception class must not leak through"))
       (finally (reset! (:running srv) false) (net/close (:fd srv))))))
+
+;; --- a plain peer that accepts and never answers ---------------------------
+;; What a cancelled provider call is parked on. Until reads were sliced, the
+;; only way out was the socket timeout: a thread interrupted while parked in
+;; recv ran the whole SO_RCVTIMEO before it noticed.
+
+(defn- start-stalling-plain [port]
+  (let [fd (srv/listen-socket port)
+        running? (atom true)
+        held (atom [])]
+    (future
+      (loop []
+        (let [raw (srv/accept-raw fd)]
+          (when @running?
+            (when-not (neg? raw) (swap! held conj raw))
+            (recur)))))
+    {:fd fd :port port :running running? :held held}))
+
+(deftest an-interrupt-unblocks-a-parked-read
+  ;; jolt's Thread.interrupt does not reach a thread inside a blocking
+  ;; syscall, so recv-bytes waits in interrupt-slice-ms slices and checks the
+  ;; flag between them. A cancelled request comes back within one slice, as
+  ;; an InterruptedException, with 10 s of socket timeout still to run.
+  (let [port 18081
+        srv (start-stalling-plain port)]
+    (try
+      (let [outcome (promise)
+            t (Thread. (fn []
+                         (let [t0 (System/currentTimeMillis)]
+                           (deliver outcome
+                                    (try (http/get (str "http://127.0.0.1:" port "/get")
+                                                   {:socket-timeout 10000})
+                                         [:returned 0]
+                                         (catch Throwable e
+                                           [(class e) (- (System/currentTimeMillis) t0)]))))))]
+        (.start t)
+        (Thread/sleep 300)
+        (.interrupt t)
+        (let [[cls elapsed] (deref outcome 5000 [:still-parked nil])]
+          (is (= java.lang.InterruptedException cls)
+              (str "the read came back as an interrupt, not a socket timeout: " cls))
+          (is (and elapsed (< elapsed 2000))
+              (str "within a slice of the interrupt, not the 10 s timeout; took " elapsed "ms"))))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
+
+(deftest a-sliced-read-still-honours-the-socket-timeout
+  (let [port 18082
+        srv (start-stalling-plain port)]
+    (try
+      (let [t0 (System/currentTimeMillis)
+            outcome (try (http/get (str "http://127.0.0.1:" port "/get")
+                                   {:socket-timeout 800})
+                         :returned
+                         (catch Throwable e (class e)))
+            elapsed (- (System/currentTimeMillis) t0)]
+        (is (= java.net.SocketTimeoutException outcome)
+            "slicing the wait does not change what a silent peer surfaces as")
+        (is (< 700 elapsed 4000)
+            (str "and the bound is still the socket timeout, not a slice; took " elapsed "ms")))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
