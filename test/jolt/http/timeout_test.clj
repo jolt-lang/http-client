@@ -6,7 +6,6 @@
   had touched jolt.ffi first."
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
-            [jolt.ffi :as ffi]
             [jolt.process :as p]
             [jolt.http.net :as net]
             [jolt.http.tls :as tls]

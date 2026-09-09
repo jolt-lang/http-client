@@ -95,6 +95,22 @@
 (ffi/defcfn c-BIO-read          "BIO_read"          [:pointer :pointer :int] :int)
 (ffi/defcfn c-BIO-write         "BIO_write"         [:pointer :pointer :int] :int)
 (ffi/defcfn c-BIO-ctrl          "BIO_ctrl"          [:pointer :int :int64 :pointer] :int64)
+;; PKCS#12 material: what a caller's :key-store / :trust-store actually holds.
+;; libcrypto side, so these resolve off the crypto object loaded above.
+(ffi/defcfn c-BIO-new-mem-buf   "BIO_new_mem_buf"   [:pointer :int] :pointer)
+(ffi/defcfn c-BIO-free          "BIO_free"          [:pointer] :int)
+(ffi/defcfn c-d2i-PKCS12-bio    "d2i_PKCS12_bio"    [:pointer :pointer] :pointer)
+(ffi/defcfn c-PKCS12-parse      "PKCS12_parse"      [:pointer :pointer :pointer :pointer :pointer] :int)
+(ffi/defcfn c-PKCS12-free       "PKCS12_free"       [:pointer] :void)
+(ffi/defcfn c-X509-free         "X509_free"         [:pointer] :void)
+(ffi/defcfn c-EVP-PKEY-free     "EVP_PKEY_free"     [:pointer] :void)
+(ffi/defcfn c-sk-num            "OPENSSL_sk_num"    [:pointer] :int)
+(ffi/defcfn c-sk-value          "OPENSSL_sk_value"  [:pointer :int] :pointer)
+(ffi/defcfn c-sk-free           "OPENSSL_sk_free"   [:pointer] :void)
+(ffi/defcfn c-SSL-CTX-use-cert-x509 "SSL_CTX_use_certificate" [:pointer :pointer] :int)
+(ffi/defcfn c-SSL-CTX-use-key-evp   "SSL_CTX_use_PrivateKey"  [:pointer :pointer] :int)
+(ffi/defcfn c-SSL-CTX-cert-store "SSL_CTX_get_cert_store" [:pointer] :pointer)
+(ffi/defcfn c-X509-STORE-add-cert "X509_STORE_add_cert" [:pointer :pointer] :int)
 
 (defn- ssl-ex
   "A typed SSLException carrying a real message. Built through
@@ -213,6 +229,125 @@
         nil))
     st))
 
+
+;; --- PKCS#12 key / trust stores --------------------------------------------
+;; babashka's `:ssl-context {:key-store … :trust-store …}` is a PKCS#12 file and a
+;; password, which is what java.net.http's KeyManagerFactory/TrustManagerFactory
+;; consume. OpenSSL reads the same container: parse it once, then a key store
+;; becomes the client certificate + private key on the SSL_CTX and a trust store
+;; becomes the CA set in the context's X509_STORE.
+
+(defn- parse-pkcs12
+  "Parse DER PKCS#12 `bytes` with `pass`. Returns {:key :cert :cas [ptr…]
+  :free (fn [])} or throws. Every pointer stays owned by the caller until :free."
+  [bytes pass]
+  (let [n (alength bytes)
+        buf (ffi/alloc (max 1 n))
+        _ (ffi/write-array buf bytes)
+        bio (c-BIO-new-mem-buf buf n)]
+    (when (ffi/null? bio)
+      (ffi/free buf)
+      (throw (ssl-ex "cannot read key/trust store into memory")))
+    (let [p12 (c-d2i-PKCS12-bio bio ffi/null)]
+      (c-BIO-free bio)
+      (when (ffi/null? p12)
+        (ffi/free buf)
+        (throw (ssl-ex "key/trust store is not a PKCS#12 container")))
+      (let [pkey-out (ffi/alloc 8)
+            cert-out (ffi/alloc 8)
+            ca-out   (ffi/alloc 8)
+            pass-buf (cstr (or pass ""))]
+        (ffi/write pkey-out :pointer ffi/null 0)
+        (ffi/write cert-out :pointer ffi/null 0)
+        (ffi/write ca-out :pointer ffi/null 0)
+        (let [rc (c-PKCS12-parse p12 pass-buf pkey-out cert-out ca-out)]
+          (ffi/free pass-buf)
+          (when (zero? rc)
+            (c-PKCS12-free p12)
+            (ffi/free pkey-out) (ffi/free cert-out) (ffi/free ca-out) (ffi/free buf)
+            (throw (ssl-ex "cannot parse key/trust store — wrong password or not PKCS#12")))
+          (let [pkey (ffi/read pkey-out :pointer 0)
+                cert (ffi/read cert-out :pointer 0)
+                cas  (ffi/read ca-out :pointer 0)
+                ca-list (if (ffi/null? cas)
+                          []
+                          (vec (for [i (range (c-sk-num cas))] (c-sk-value cas i))))]
+            (ffi/free pkey-out) (ffi/free cert-out) (ffi/free ca-out)
+            {:key (when-not (ffi/null? pkey) pkey)
+             :cert (when-not (ffi/null? cert) cert)
+             :cas ca-list
+             :free (fn []
+                     (when-not (ffi/null? pkey) (c-EVP-PKEY-free pkey))
+                     (when-not (ffi/null? cert) (c-X509-free cert))
+                     (doseq [c ca-list] (c-X509-free c))
+                     (when-not (ffi/null? cas) (c-sk-free cas))
+                     (c-PKCS12-free p12)
+                     (ffi/free buf))}))))))
+
+(defn- apply-key-store! [ctx {:keys [bytes pass]}]
+  (let [{:keys [key cert free]} (parse-pkcs12 bytes pass)]
+    (try
+      (when (and cert (not= 1 (c-SSL-CTX-use-cert-x509 ctx cert)))
+        (throw (ssl-ex "cannot use the key store's certificate")))
+      (when (and key (not= 1 (c-SSL-CTX-use-key-evp ctx key)))
+        (throw (ssl-ex "cannot use the key store's private key")))
+      (finally (free)))))
+
+(defn- apply-trust-store! [ctx {:keys [bytes pass]}]
+  (let [{:keys [cert cas free]} (parse-pkcs12 bytes pass)
+        store (c-SSL-CTX-cert-store ctx)]
+    (try
+      ;; A trust store is a bag of CAs; PKCS12_parse hands the leaf back
+      ;; separately from the chain, and both are trust anchors here.
+      (doseq [c (cons cert cas) :when c] (c-X509-STORE-add-cert store c))
+      (finally (free)))))
+
+(defn- client-ctx
+  "A client SSL_CTX configured for `insecure?` and the caller's stores. A trust
+  store REPLACES the platform CA set, the way a TrustManagerFactory over a
+  truststore does on the JVM."
+  [insecure? {:keys [key-store trust-store] :as _ssl}]
+  (let [ctx (c-SSL-CTX-new (c-TLS-client-method))]
+    (when (ffi/null? ctx) (throw (ssl-ex "SSL_CTX_new failed")))
+    (try
+      (when key-store (apply-key-store! ctx key-store))
+      (if insecure?
+        (c-SSL-CTX-set-verify ctx VERIFY-NONE ffi/null)
+        (do (if trust-store
+              (apply-trust-store! ctx trust-store)
+              (c-SSL-CTX-default-verify ctx))
+            (c-SSL-CTX-set-verify ctx VERIFY-PEER ffi/null)))
+      ctx
+      (catch Throwable e (c-SSL-CTX-free ctx) (throw e)))))
+
+(defn- start-client-session
+  "Build the SSL object + memory BIOs for a client handshake over `sock`, run the
+  handshake and return the stream. Owns ctx from here on."
+  [ctx sock host insecure?]
+  (let [ssl     (c-SSL-new ctx)
+        memmeth (c-BIO-s-mem)
+        rbio    (c-BIO-new memmeth)
+        wbio    (c-BIO-new memmeth)
+        host-buf (cstr host)]
+    (c-SSL-set-bio ssl rbio wbio)
+    (c-SSL-set-connect ssl)
+    (c-SSL-ctrl ssl SET-TLSEXT-HOSTNAME NAMETYPE-host-name host-buf)  ; SNI
+    (when-not insecure? (c-SSL-set1-host ssl host-buf))
+    (let [st (make-stream sock ssl ctx rbio wbio)]
+      (try (handshake! st true)
+           (catch Throwable e ((jolt.host/ref-get st :close)) (ffi/free host-buf) (throw e)))
+      (ffi/free host-buf)
+      st)))
+
+(defn tls-wrap-client
+  "Run the client side of a TLS handshake over an ALREADY CONNECTED socket fd.
+  This is what a proxy CONNECT tunnel needs: the TCP connection goes to the
+  proxy, the handshake goes to the origin, and `host` is the origin's name — so
+  SNI and certificate verification both name the origin, not the proxy."
+  ([sock host insecure?] (tls-wrap-client sock host insecure? nil))
+  ([sock host insecure? ssl]
+   (start-client-session (client-ctx insecure? ssl) sock host insecure?)))
+
 (defn tls-connect
   "Open a TLS client connection to host:port. insecure? disables peer
   verification (self-signed/expired certs accepted). read-timeout, in
@@ -224,28 +359,13 @@
   ([host port insecure?] (tls-connect host port insecure? nil nil))
   ([host port insecure? read-timeout] (tls-connect host port insecure? read-timeout nil))
   ([host port insecure? read-timeout conn-timeout]
-  (let [ctx (c-SSL-CTX-new (c-TLS-client-method))]
-    (when (ffi/null? ctx) (throw (ssl-ex "SSL_CTX_new failed")))
-    (if insecure?
-      (c-SSL-CTX-set-verify ctx VERIFY-NONE ffi/null)
-      (do (c-SSL-CTX-default-verify ctx)
-          (c-SSL-CTX-set-verify ctx VERIFY-PEER ffi/null)))
-    (let [ssl     (c-SSL-new ctx)
-          memmeth (c-BIO-s-mem)
-          rbio    (c-BIO-new memmeth)
-          wbio    (c-BIO-new memmeth)
-          host-buf (cstr host)]
-      (c-SSL-set-bio ssl rbio wbio)
-      (c-SSL-set-connect ssl)
-      (c-SSL-ctrl ssl SET-TLSEXT-HOSTNAME NAMETYPE-host-name host-buf)  ; SNI
-      (when-not insecure? (c-SSL-set1-host ssl host-buf))
-      (let [sock (net/connect host port conn-timeout)
-            _    (net/set-read-timeout! sock read-timeout)
-            st   (make-stream sock ssl ctx rbio wbio)]
-        (try (handshake! st true)
-             (catch Throwable e ((jolt.host/ref-get st :close)) (ffi/free host-buf) (throw e)))
-        (ffi/free host-buf)
-        st)))))
+   (tls-connect host port insecure? read-timeout conn-timeout nil))
+  ([host port insecure? read-timeout conn-timeout ssl]
+   (let [ctx  (client-ctx insecure? ssl)
+         sock (try (net/connect host port conn-timeout)
+                   (catch Throwable e (c-SSL-CTX-free ctx) (throw e)))]
+     (net/set-read-timeout! sock read-timeout)
+     (start-client-session ctx sock host insecure?))))
 
 (defn tls-wrap-server
   "Wrap an accepted plain socket fd `sock` as the server side of a TLS session,

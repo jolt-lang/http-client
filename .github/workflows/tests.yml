@@ -1,21 +1,25 @@
 name: tests
 on: [push, pull_request]
 # One pinned jolt, not whatever the latest release happens to be. The supported
-# floor is 0.8.0, which deps.edn declares as :jolt/min-version: jolt.ffi/write
+# floor is 0.8.1, which deps.edn declares as :jolt/min-version: jolt.ffi/write
 # takes the value before the offset from 0.8.0 on, and the two spellings are
 # both integers, so on 0.7.x the zlib path wrote to the wrong place and the
 # compressed-body tests crashed (then the server they left behind held port
 # 18091 and every later suite died on bind). 0.7.19 was the floor before that:
 # jolt.http.net reads errno through jolt.io-poller, and 0.7.19 is where jolt's
 # own java.io byte streams answer the full surface (readNBytes/transferTo/mark).
+# 0.8.1 raised it once more: that is where java.util.concurrent's executor
+# interfaces entered jolt's class graph, without which babashka.http-client's
+# ->Executor builds a pool that answers false to (instance? ThreadPoolExecutor).
 #
-# Raise the pin as new jolt releases land.
+# The pin is the DECLARED FLOOR, not the newest release, so CI tests the oldest
+# jolt deps.edn claims to support. Raise both together.
 
 jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      JOLT_VERSION: '0.8.0'
+      JOLT_VERSION: '0.8.1'
     steps:
       - uses: actions/checkout@v4
       - name: Install jolt
@@ -31,5 +35,17 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/jolt-lang/jolt/main/install \
             | bash -s -- --dir "$HOME/.jolt" --version "$JOLT_VERSION"
           echo "$HOME/.jolt" >> "$GITHUB_PATH"
-      - name: Test
+      # Each suite is its own process on purpose: they bind their own ports and
+      # stand up their own servers, and a suite that leaves a listener behind
+      # takes the next one down with it. :timeouttest is deliberately absent —
+      # one of its cases fetches https://example.com, so it needs egress.
+      - name: clj-http-lite suites
         run: JOLT_PWD="$PWD" jolt -M:test
+      - name: babashka.http-client compatibility
+        run: JOLT_PWD="$PWD" jolt -M:bhctest
+      - name: WebSocket
+        run: JOLT_PWD="$PWD" jolt -M:wstest
+      - name: TLS
+        run: JOLT_PWD="$PWD" jolt -M:tlstest
+      - name: zlib
+        run: JOLT_PWD="$PWD" jolt -M:zlibtest
