@@ -590,14 +590,37 @@
   (or (= "HEAD" (str/upper-case (str method)))
       (= 204 status) (= 304 status) (< 99 status 200)))
 
+(defn connection-gone?
+  "Whether `t` says the connection went away rather than that the request
+  failed: a clean close, a reset, or a broken pipe. A read TIMEOUT is none of
+  these — it says the peer is slow, not that it is gone — and must not be
+  mistaken for one.
+
+  Which of these a retired keep-alive socket produces is not something a client
+  gets to choose: Linux sends RST rather than FIN when it closes a socket with
+  unread data, so the same dead connection surfaces as SocketException there and
+  as a clean EOF elsewhere."
+  [t]
+  (contains? #{"class java.io.EOFException" "class java.net.SocketException"}
+             (str (class t))))
+
 (defn read-response
   "Read one HTTP/1.1 response off `stream`, framed the way the response says it
   is framed. `deadline` is an absolute System/currentTimeMillis bound on the
-  whole read; `method` decides whether a body is expected at all."
-  ([stream] (read-response stream nil "GET"))
-  ([stream deadline] (read-response stream deadline "GET"))
-  ([stream deadline method]
+  whole read; `method` decides whether a body is expected at all.
+
+  `received`, when given, is an atom set to true the moment the first response
+  byte arrives. It is what tells a caller holding a reused connection whether a
+  failure means the peer never answered."
+  ([stream] (read-response stream nil "GET" nil))
+  ([stream deadline] (read-response stream deadline "GET" nil))
+  ([stream deadline method] (read-response stream deadline method nil))
+  ([stream deadline method received]
    (let [deadline (effective-deadline deadline)
+         read-more! (fn [stream deadline]
+                      (let [b (read-more! stream deadline)]
+                        (when (and b received) (reset! received true))
+                        b))
          ;; headers first: read until the blank line, rescanning only the tail
          [buf end] (loop [buf (byte-array 0) scanned 0]
                      (let [s (ba->latin1 buf)]

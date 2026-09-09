@@ -515,13 +515,14 @@
 (defn- exchange-once
   "One request/response over `stream`. Releases the connection back to the pool
   when the response says it may be kept, and closes it otherwise — including on
-  the way out of a failure, where the state of the connection is unknown."
-  [stream absolute? key {:keys [url method headers body deadline]}]
+  the way out of a failure, where the state of the connection is unknown.
+  `received` is set as soon as any response byte arrives."
+  [stream absolute? key {:keys [url method headers body deadline]} received]
   (let [ok (atom false)]
     (try
       (core/s-write stream (core/build-request method url headers body
                                                (when absolute? (core/spec-no-ref url))))
-      (let [resp (core/read-response stream deadline method)]
+      (let [resp (core/read-response stream deadline method received)]
         (reset! ok (:reusable? resp))
         resp)
       (finally
@@ -533,9 +534,12 @@
   "One request/response, over a pooled connection when one is available.
 
   A pooled connection the peer retired between requests looks exactly like a
-  live one until the read comes back with nothing at all; that is the single
-  case retried on a fresh connection, and it is safe to retry even a POST there
-  because a peer that never sent a byte never acted on the request."
+  live one until the exchange fails, and it fails differently depending on the
+  platform — a clean EOF where the peer sent FIN, a reset where it sent RST,
+  which is what Linux does when it closes a socket with unread data. Either way
+  the test is the same: did any response byte arrive? If none did, the peer
+  cannot have acted on the request, so it is retried on a fresh connection, and
+  that is safe even for a POST."
   [{:keys [url method read-timeout conn-timeout insecure? proxy ssl] :as req}]
   (let [https? (= "https" (tget url :protocol))
         port (core/effective-port url)
@@ -543,17 +547,19 @@
         key (core/pool-key host port https? insecure? ssl proxy)
         open! (fn [] (open-stream {:host host :port port :https? https?
                                    :insecure? insecure? :read-timeout read-timeout
-                                   :conn-timeout conn-timeout :proxy proxy :ssl ssl}))]
+                                   :conn-timeout conn-timeout :proxy proxy :ssl ssl}))
+        fresh! (fn [] (let [[stream absolute?] (open!)]
+                        (exchange-once stream absolute? key req (atom false))))]
     (if-let [pooled (core/pool-acquire key)]
-      (try
-        (core/set-stream-timeout! pooled read-timeout)
-        (exchange-once pooled (boolean (and proxy (not https?))) key req)
-        (catch Throwable t
-          (if (= "class java.io.EOFException" (str (class t)))
-            (let [[stream absolute?] (open!)] (exchange-once stream absolute? key req))
-            (throw t))))
-      (let [[stream absolute?] (open!)]
-        (exchange-once stream absolute? key req)))))
+      (let [received (atom false)]
+        (try
+          (core/set-stream-timeout! pooled read-timeout)
+          (exchange-once pooled (boolean (and proxy (not https?))) key req received)
+          (catch Throwable t
+            (if (and (not @received) (core/connection-gone? t))
+              (fresh!)
+              (throw t)))))
+      (fresh!))))
 
 (defn- request-headers
   "The wire headers for one hop: what the caller set, plus a Cookie header from

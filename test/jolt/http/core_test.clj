@@ -299,6 +299,37 @@
           (is (= 3 (:requests @(:stats s))))
           (finally (core/pool-clear!) (srv/stop s)))))))
 
+(defn- typed [cls] (try (core/throw-typed cls "x") (catch Throwable t t)))
+
+(deftest connection-gone-tells-a-dead-socket-from-a-slow-one
+  (testing "a peer that went away, however the platform reports it"
+    (is (true? (core/connection-gone? (typed "java.io.EOFException"))))
+    (is (true? (core/connection-gone? (typed "java.net.SocketException")))))
+  (testing "a timeout says the peer is slow, not gone, and is never retried"
+    (is (false? (core/connection-gone? (typed "java.net.SocketTimeoutException")))))
+  (testing "a malformed response is the peer's answer, not its absence"
+    (is (false? (core/connection-gone? (typed "java.io.IOException"))))))
+
+(defn- truncating-handler
+  "Answers the first request on a connection; on the next one sends headers and
+  then hangs up mid-body."
+  [req]
+  (if (pos? (:request-number req)) :truncate {:status 200 :body "ok"}))
+
+(deftest a-failure-after-bytes-arrive-is-not-replayed
+  ;; the retry is only safe while the peer cannot have acted on the request.
+  ;; Once a byte of response has arrived it plainly has, so the error surfaces.
+  (let [port (next-pool-port)
+        s (srv/start-persistent port truncating-handler)]
+    (core/pool-clear!)
+    (binding [*pool-base* (str "http://localhost:" port)]
+      (try
+        (is (= "ok" (:body (get! "/first"))))
+        (is (= 1 (core/pool-count)))
+        (is (thrown? Exception (get! "/second")))
+        (is (= 2 (:requests @(:stats s))) "not replayed on a fresh connection")
+        (finally (core/pool-clear!) (srv/stop s))))))
+
 (deftest a-dead-connection-is-dropped-before-it-is-used
   (with-pool-server
    (fn [s]

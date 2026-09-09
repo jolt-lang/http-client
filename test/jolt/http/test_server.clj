@@ -255,8 +255,14 @@
                   ;; purpose: answer the first request, hang up on the next.
                   (let [resp (handler (assoc req :request-number n))]
                     (swap! stats update :requests inc)
-                    (if (= :hangup resp)
-                      (swap! stats update :per-connection conj (inc n))
+                    (if (contains? #{:hangup :truncate} resp)
+                      (do (when (= :truncate resp)
+                            ;; headers promising a body, then nothing: the
+                            ;; caller HAS received bytes, so this must not be
+                            ;; replayed on a fresh connection
+                            (conn-write conn (latin1->ba (str "HTTP/1.1 200 OK\r\n"
+                                                              "Content-Length: 100\r\n\r\n"))))
+                          (swap! stats update :per-connection conj (inc n)))
                       (do (write-persistent-response conn resp)
                           (if (:close resp)
                             (swap! stats update :per-connection conj (inc n))
