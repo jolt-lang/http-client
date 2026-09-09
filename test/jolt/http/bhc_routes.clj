@@ -6,6 +6,10 @@
   (:require [clojure.string :as str]
             [jolt.http.zlib :as zlib]))
 
+;; built once: (byte-array (repeat n …)) walks a boxed seq, and paying that per
+;; request would put the server, not the client, in the throughput measurement
+(def ^:private big-body (byte-array (repeat (* 8 1024 1024) (byte 65))))
+
 (defn- echo-headers [req]
   (str/join "\n" (map (fn [[k v]] (str k ": " v)) (sort (:headers req)))))
 
@@ -19,6 +23,26 @@
     (cond
       ;; echoes every request header, one per line
       (= uri "/get") {:status 200 :body (echo-headers req)}
+      ;; echoes the request target, so a fragment reaching the wire is visible
+      (= uri "/echo-target") {:status 200 :body (:target req)}
+      ;; length + checksum of the body as received, without re-encoding it
+      (= uri "/body-info")
+      {:status 200 :body (str (count body) " " (reduce + 0 (map int body)))}
+      (= uri "/big") {:status 200 :body big-body}
+
+      ;; a Location with no leading slash: resolves against the base directory
+      (= uri "/deep/rel-redirect") {:status 302 :headers {"location" "target"} :body ""}
+      (= uri "/deep/dot-redirect") {:status 302 :headers {"location" "../target"} :body ""}
+      (= uri "/deep/target") {:status 200 :body "deep-target"}
+      (= uri "/target") {:status 200 :body "root-target"}
+
+      (= uri "/secure-cookie")
+      {:status 200 :headers {"Set-Cookie" ["sec=1; Path=/; Secure" "plain=1; Path=/"]} :body "set"}
+      (= uri "/expire-cookie") {:status 200 :headers {"Set-Cookie" "a=1; Path=/; Max-Age=0"} :body "gone"}
+      (= uri "/past-cookie")
+      {:status 200
+       :headers {"Set-Cookie" "old=1; Path=/; Expires=Wed, 21 Oct 2015 07:28:00 GMT"}
+       :body "gone"}
       ;; echoes the request body verbatim
       (= uri "/echo") {:status 200 :body body}
       ;; echoes the method, so :method / :request-method routing is visible

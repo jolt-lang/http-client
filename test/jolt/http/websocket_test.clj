@@ -6,6 +6,7 @@
   (:require [jolt.http.platform]
             [babashka.http-client.websocket :as ws]
             [jolt.http.test-server :as srv]
+            [jolt.http.core]
             [jolt.http.websocket :as impl]
             [clojure.test :refer [deftest is testing run-tests use-fixtures]]))
 
@@ -172,6 +173,38 @@
     (is (instance? java.util.concurrent.CompletableFuture f))
     (let [sock @f]
       (is (instance? java.net.http.WebSocket sock))
+      (ws/close! sock))))
+
+(deftest decode-frame-at-offset
+  (testing "frames decode in place, without recopying the tail per frame"
+    (let [a (impl/encode-frame impl/op-text (.getBytes "a" "UTF-8") {})
+          b (impl/encode-frame impl/op-text (.getBytes "bb" "UTF-8") {})
+          buf (byte-array (concat (seq a) (seq b)))
+          [f1 o1] (impl/decode-frame-at buf 0)
+          [f2 o2] (impl/decode-frame-at buf o1)]
+      (is (= "a" (String. ^bytes (:payload f1) "UTF-8")))
+      (is (= (alength a) o1))
+      (is (= "bb" (String. ^bytes (:payload f2) "UTF-8")))
+      (is (= (alength buf) o2))
+      (is (nil? (impl/decode-frame-at buf o2)))))
+  (testing "a partial frame reports nothing rather than a wrong length"
+    (let [a (impl/encode-frame impl/op-binary (byte-array (range 100)) {})]
+      (is (nil? (impl/decode-frame-at (jolt.http.core/sub-ba a 0 (- (alength a) 5)) 0))))))
+
+(deftest large-binary-message-is-linear
+  (testing "a 4MB binary message assembled across many socket reads"
+    (let [n (* 4 1024 1024)
+          payload (byte-array (repeat n (byte 90)))
+          got (promise)
+          sock (ws/websocket {:uri base
+                              :on-message (fn [_ data last?]
+                                            (when last?
+                                              (deliver got (.remaining data))))})
+          t0 (System/currentTimeMillis)]
+      (ws/send! sock payload)
+      (is (= n (deref got 60000 :timeout)))
+      (let [took (- (System/currentTimeMillis) t0)]
+        (is (< took 20000) (str "4MB round trip took " took "ms")))
       (ws/close! sock))))
 
 (defn -main [& _]

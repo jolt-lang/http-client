@@ -12,6 +12,7 @@
             [babashka.http-client.websocket :as ws]
             [jolt.http.bhc-routes :as routes]
             [jolt.http.test-server :as srv]
+            [jolt.http.tls :as tls]
             [clojure.test :refer [deftest is testing run-tests use-fixtures]]))
 
 (def ^:private https-port 18101)
@@ -101,6 +102,25 @@
 
 (deftest wss-refuses-an-untrusted-certificate
   (is (thrown? Exception (ws/websocket {:uri (str "wss://localhost:" wss-port)}))))
+
+(deftest ssl-contexts-are-shared-across-connections
+  (testing "the same client configuration reuses one SSL_CTX"
+    ;; A verifying context loads the platform CA bundle; building one measured
+    ;; 5.7ms against 0.09ms for an insecure one, and it used to be built per
+    ;; request. Identity, not timing, is what this asserts.
+    (let [a (#'tls/client-ctx false nil)
+          b (#'tls/client-ctx false nil)
+          insecure (#'tls/client-ctx true nil)]
+      (is (= a b) "two verifying clients share a context")
+      (is (not= a insecure) "verify and no-verify are different contexts")))
+  (testing "a trust store gets its own context, and still verifies"
+    (let [c (http/client {:ssl-context {:trust-store truststore :trust-store-pass "jolt"}})]
+      (is (= 200 (:status (http/get (str base "/200") {:client c}))))
+      (is (= 200 (:status (http/get (str base "/200") {:client c}))))
+      (is (thrown? Exception (http/get (str base "/200"))))))
+  (testing "repeat requests on one client still work after the context is cached"
+    (let [c (http/client {:ssl-context {:insecure true}})]
+      (dotimes [_ 5] (is (= 200 (:status (http/get (str base "/200") {:client c}))))))))
 
 (defn -main [& _]
   (let [r (run-tests 'jolt.http.tls-test)]

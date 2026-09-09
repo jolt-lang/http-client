@@ -48,52 +48,66 @@
                    (let [k (byte-array 4)]
                      (.nextBytes (java.security.SecureRandom.) k)
                      k))
-        head (concat [(bit-or (if fin? 0x80 0) opcode)
-                      (bit-or (if mask? 0x80 0) len7)]
-                     len-bytes
-                     (when mask-key (map (fn [i] (ub mask-key i)) (range 4))))
-        out (byte-array (+ (count head) n))]
-    (dotimes [i (count head)] (aset out i (byte (let [v (nth head i)] (if (> v 127) (- v 256) v)))))
-    (dotimes [i n]
-      (aset out (+ (count head) i)
-            (byte (let [v (if mask-key
-                            (bit-xor (ub payload i) (ub mask-key (mod i 4)))
-                            (ub payload i))]
-                    (if (> v 127) (- v 256) v)))))
+        head (vec (concat [(bit-or (if fin? 0x80 0) opcode)
+                           (bit-or (if mask? 0x80 0) len7)]
+                          len-bytes
+                          (when mask-key (map (fn [i] (ub mask-key i)) (range 4)))))
+        hn (count head)
+        out (byte-array (+ hn n))]
+    (dotimes [i hn] (aset out i (byte (let [v (nth head i)] (if (> v 127) (- v 256) v)))))
+    (if mask-key
+      (dotimes [i n]
+        (aset out (+ hn i)
+              (byte (let [v (bit-xor (ub payload i) (ub mask-key (mod i 4)))]
+                      (if (> v 127) (- v 256) v)))))
+      ;; nothing to transform, so move the payload in one go rather than a
+      ;; boxed read/write per byte
+      (core/copy-into! payload 0 out hn n))
     out))
 
-(defn decode-frame
-  "Decode one frame from the front of byte-array `buf`. Returns
-  [{:opcode :fin? :payload} rest-bytes] or nil when `buf` holds an incomplete
-  frame and more has to be read."
-  [^bytes buf]
-  (let [n (alength buf)]
+(defn decode-frame-at
+  "Decode one frame from `buf` starting at `off`. Returns
+  [{:opcode :fin? :payload} next-off] or nil when the buffer holds an incomplete
+  frame and more has to be read.
+
+  Offset-based rather than slicing: the reader accumulates frames into one
+  buffer, and handing back a fresh copy of everything after each frame made a
+  message of k frames cost O(k·bytes). A server-to-client frame is unmasked, so
+  its payload is a single bulk copy."
+  [^bytes buf off]
+  (let [n (- (alength buf) off)]
     (when (>= n 2)
-      (let [b0 (ub buf 0)
-            b1 (ub buf 1)
+      (let [b0 (ub buf off)
+            b1 (ub buf (+ off 1))
             fin? (pos? (bit-and b0 0x80))
             opcode (bit-and b0 0x0f)
             masked? (pos? (bit-and b1 0x80))
             len7 (bit-and b1 0x7f)
             [len len-size] (cond
                              (< len7 126) [len7 0]
-                             (= len7 126) (when (>= n 4) [(+ (bit-shift-left (ub buf 2) 8) (ub buf 3)) 2])
+                             (= len7 126) (when (>= n 4)
+                                            [(+ (bit-shift-left (ub buf (+ off 2)) 8) (ub buf (+ off 3))) 2])
                              :else (when (>= n 10)
-                                     [(reduce (fn [acc i] (+ (* acc 256) (ub buf i))) 0 (range 2 10)) 8]))]
+                                     [(reduce (fn [acc i] (+ (* acc 256) (ub buf (+ off i)))) 0 (range 2 10)) 8]))]
         (when len
-          (let [key-off (+ 2 len-size)
+          (let [key-off (+ off 2 len-size)
                 data-off (+ key-off (if masked? 4 0))]
-            (when (>= n (+ data-off len))
+            (when (>= n (+ (- data-off off) len))
               (let [payload (byte-array len)]
-                (dotimes [i len]
-                  (let [v (if masked?
-                            (bit-xor (ub buf (+ data-off i)) (ub buf (+ key-off (mod i 4))))
-                            (ub buf (+ data-off i)))]
-                    (aset payload i (byte (if (> v 127) (- v 256) v)))))
-                (let [used (+ data-off len)
-                      remaining (byte-array (- n used))]
-                  (dotimes [i (- n used)] (aset remaining i (aget buf (+ used i))))
-                  [{:opcode opcode :fin? fin? :payload payload} remaining])))))))))
+                (if masked?
+                  (dotimes [i len]
+                    (let [v (bit-xor (ub buf (+ data-off i)) (ub buf (+ key-off (mod i 4))))]
+                      (aset payload i (byte (if (> v 127) (- v 256) v)))))
+                  (core/copy-into! buf data-off payload 0 len))
+                [{:opcode opcode :fin? fin? :payload payload} (+ data-off len)]))))))))
+
+(defn decode-frame
+  "Decode one frame from the front of byte-array `buf`. Returns
+  [{:opcode :fin? :payload} rest-bytes] or nil when `buf` holds an incomplete
+  frame and more has to be read."
+  [^bytes buf]
+  (when-let [[frame next-off] (decode-frame-at buf 0)]
+    [frame (core/sub-ba buf next-off (alength buf))]))
 
 ;; ---------------------------------------------------------------------------
 ;; handshake
@@ -178,10 +192,19 @@
   nil)
 
 (defn- reader-loop [ws listener leftover]
-  (let [stream (tget ws :stream)]
+  (let [stream (tget ws :stream)
+        ;; A read appends to the buffer and decoding advances an offset through
+        ;; it; the buffer is compacted only once the consumed prefix is worth
+        ;; reclaiming. Re-slicing per frame and per read made a multi-megabyte
+        ;; message quadratic — a 4MB round trip took over 90 seconds.
+        append (fn [buf off chunk]
+                 (if (zero? off)
+                   [(core/concat-ba buf chunk) 0]
+                   [(core/concat-bas [(core/sub-ba buf off (alength buf)) chunk]) 0]))]
     (loop [buf leftover
+           off 0
            frag {:opcode nil :parts []}]
-      (if-let [[frame rest-bytes] (decode-frame buf)]
+      (if-let [[frame next-off] (decode-frame-at buf off)]
         (let [{:keys [opcode fin? payload]} frame]
           (cond
             (= opcode op-close)
@@ -204,11 +227,11 @@
                 ;; RFC 6455 5.5.2: a pong must carry the ping's payload
                 (try (core/s-write stream (encode-frame op-pong payload {:mask? true}))
                      (catch Throwable _ nil))
-                (recur rest-bytes frag))
+                (recur buf next-off frag))
 
             (= opcode op-pong)
             (do (safely ws listener (.onPong listener ws (java.nio.ByteBuffer/wrap payload)))
-                (recur rest-bytes frag))
+                (recur buf next-off frag))
 
             :else
             ;; text/binary/continuation. The JDK hands each fragment to the
@@ -218,14 +241,14 @@
               (if (= kind op-text)
                 (safely ws listener (.onText listener ws (String. payload "UTF-8") fin?))
                 (safely ws listener (.onBinary listener ws (java.nio.ByteBuffer/wrap payload) fin?)))
-              (recur rest-bytes (if fin? {:opcode nil :parts []} {:opcode kind :parts []})))))
+              (recur buf next-off (if fin? {:opcode nil :parts []} {:opcode kind :parts []})))))
         ;; incomplete frame: read more
         (let [chunk (try (core/s-read stream nil)
                          (catch Throwable t
                            (when-not (tget ws :input-closed) (on-error! ws listener t))
                            nil))]
           (if chunk
-            (recur (core/concat-ba buf chunk) frag)
+            (let [[buf off] (append buf off chunk)] (recur buf off frag))
             (when-not (tget ws :input-closed)
               (tput! ws :input-closed true)
               (safely ws listener (.onClose listener ws 1006 ""))

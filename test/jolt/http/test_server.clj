@@ -5,6 +5,7 @@
   handler routes."
   (:require [clojure.string :as str]
             [jolt.ffi :as ffi]
+            [jolt.http.core]
             [jolt.http.net :as net]
             [jolt.http.tls :as tls]
             [jolt.http.websocket :as ws]))
@@ -22,6 +23,21 @@
 (def ^:private sol-socket (if macos? 0xffff 1))
 (def ^:private so-reuse   (if macos? 4 2))
 
+(def ^:private AF-INET6 (if macos? 30 10))
+
+(defn- make-sockaddr6
+  "struct sockaddr_in6, ::1. 28 bytes; macOS carries a length byte at offset 0."
+  [port]
+  (let [sa (ffi/alloc 28)]
+    (dotimes [i 28] (ffi/write sa :uint8 0 i))
+    (if macos?
+      (do (ffi/write sa :uint8 28 0) (ffi/write sa :uint8 AF-INET6 1))
+      (ffi/write sa :uint8 AF-INET6 0))
+    (ffi/write sa :uint8 (bit-and (bit-shift-right port 8) 0xff) 2)
+    (ffi/write sa :uint8 (bit-and port 0xff) 3)
+    (ffi/write sa :uint8 1 23)                       ; ::1
+    sa))
+
 (defn- make-sockaddr [port]
   (let [sa (ffi/alloc 16)]
     (dotimes [i 16] (ffi/write sa :uint8 0 i))
@@ -33,19 +49,23 @@
     (ffi/write sa :uint8 127 4) (ffi/write sa :uint8 1 7)   ; 127.0.0.1
     sa))
 
-(defn listen-socket [port]
-  (let [fd (c-socket AF-INET SOCK-STREAM 0)]
-    (when (neg? fd) (throw (ex-info "socket() failed" {})))
-    (let [opt (ffi/alloc 4)]
-      (ffi/write opt :int 1 0)
-      (c-setsockopt fd sol-socket so-reuse opt 4)
-      (ffi/free opt))
-    (let [sa (make-sockaddr port)]
-      (when (neg? (c-bind fd sa 16))
-        (net/close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
-      (ffi/free sa))
-    (when (neg? (c-listen fd 64)) (net/close fd) (throw (ex-info "listen() failed" {})))
-    fd))
+(defn listen-socket
+  ([port] (listen-socket port nil))
+  ([port family]
+   (let [v6? (= :ipv6 family)
+         fd (c-socket (if v6? AF-INET6 AF-INET) SOCK-STREAM 0)]
+     (when (neg? fd) (throw (ex-info "socket() failed" {})))
+     (let [opt (ffi/alloc 4)]
+       (ffi/write opt :int 1 0)
+       (c-setsockopt fd sol-socket so-reuse opt 4)
+       (ffi/free opt))
+     (let [sa (if v6? (make-sockaddr6 port) (make-sockaddr port))
+           len (if v6? 28 16)]
+       (when (neg? (c-bind fd sa len))
+         (net/close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
+       (ffi/free sa))
+     (when (neg? (c-listen fd 64)) (net/close fd) (throw (ex-info "listen() failed" {})))
+     fd)))
 
 (defn accept-raw
   "Block until a connection arrives on `listen-fd`; return the raw fd. Exposed so
@@ -128,7 +148,8 @@
 
 (defn- body->ba [body]
   (cond (nil? body) (byte-array 0)
-        (string? body) (byte-array (.getBytes ^String body "UTF-8"))
+        (string? body) (.getBytes ^String body "UTF-8")
+        (bytes? body) body
         :else (byte-array body)))
 
 (defn write-response
@@ -182,12 +203,125 @@
   "Listen on `port` and serve `handler` (default: the clj-http-lite routes).
   opts: :handler (a fn of the ring-ish request map, which also carries :conn —
   a handler returning :hijacked has taken the connection over), :concurrent?
-  (default true)."
+  (default true), :host (:ipv6 to bind ::1 instead of 127.0.0.1)."
   ([port] (start-plain port {}))
-  ([port {:keys [handler concurrent?] :or {concurrent? true}}]
-   (let [fd (listen-socket port) running? (atom true)]
+  ([port {:keys [handler concurrent? host] :or {concurrent? true}}]
+   (let [fd (listen-socket port host) running? (atom true)]
      (future (accept-loop fd running? nil (or handler default-handler) concurrent?))
      {:fd fd :port port :running running?})))
+
+;; --- persistent (keep-alive) server ----------------------------------------
+;; Every other server here answers once and closes, which is exactly the shape
+;; that makes connection reuse invisible. This one holds the connection open and
+;; counts how many requests arrive on each, so a test can tell a reused socket
+;; from a fresh one.
+
+(defn- write-persistent-response [conn resp]
+  (let [body (body->ba (:body resp))
+        sb (StringBuilder.)]
+    (.append sb (str "HTTP/1.1 " (:status resp) " " (get status-text (:status resp) "OK") "\r\n"))
+    (doseq [[k v] (:headers resp)
+            v (if (or (sequential? v) (set? v)) v [v])]
+      (.append sb (str k ": " v "\r\n")))
+    (when (:close resp) (.append sb "Connection: close\r\n"))
+    (if (:chunked resp)
+      (.append sb "Transfer-Encoding: chunked\r\n\r\n")
+      (.append sb (str "Content-Length: " (alength body) "\r\n\r\n")))
+    (conn-write conn (latin1->ba (.toString sb)))
+    (if (:chunked resp)
+      (do (doseq [part (partition-all 7 (seq body))]
+            (conn-write conn (latin1->ba (format "%x\r\n" (count part))))
+            (conn-write conn (byte-array part))
+            (conn-write conn (latin1->ba "\r\n")))
+          (conn-write conn (latin1->ba "0\r\n\r\n")))
+      (when (pos? (alength body)) (conn-write conn body)))))
+
+(defn- persistent-serve [conn handler stats running?]
+  (try
+    (loop [acc "" n 0]
+      (let [chunk (when @running? (conn-read conn))]
+        (if (nil? chunk)
+          (when (pos? n) (swap! stats update :per-connection conj n))
+          (let [acc (str acc (ba->latin1 chunk))
+                he (str/index-of acc "\r\n\r\n")]
+            (if (nil? he)
+              (recur acc n)
+              (let [req (parse-request acc)]
+                (if (< (- (count acc) (+ he 4)) (:content-length req))
+                  (recur acc n)
+                  ;; :request-number lets a handler behave differently on a
+                  ;; REUSED connection than on a fresh one, which is the only
+                  ;; way to drive the client's stale-connection retry on
+                  ;; purpose: answer the first request, hang up on the next.
+                  (let [resp (handler (assoc req :request-number n))]
+                    (swap! stats update :requests inc)
+                    (if (contains? #{:hangup :truncate} resp)
+                      (do (when (= :truncate resp)
+                            ;; headers promising a body, then nothing: the
+                            ;; caller HAS received bytes, so this must not be
+                            ;; replayed on a fresh connection
+                            (conn-write conn (latin1->ba (str "HTTP/1.1 200 OK\r\n"
+                                                              "Content-Length: 100\r\n\r\n"))))
+                          (swap! stats update :per-connection conj (inc n)))
+                      (do (write-persistent-response conn resp)
+                          (if (:close resp)
+                            (swap! stats update :per-connection conj (inc n))
+                            (recur (subs acc (+ he 4 (:content-length req))) (inc n)))))))))))))
+    (catch Throwable _ nil)
+    (finally (try (conn-close conn) (catch Throwable _ nil)))))
+
+(defn start-persistent
+  "A server that keeps connections open. :stats holds {:requests n
+  :per-connection [n …]} — one entry per connection that has finished, so a
+  test can assert that several requests shared one socket. A handler may return
+  :chunked true to frame the body with Transfer-Encoding, or :close true to ask
+  the client to hang up.
+
+  Accepted connections are tracked in :conns and closed by `stop`. Closing only
+  the listening socket is not enough for a server whose whole point is that
+  connections outlive a request: Linux refuses to rebind the port while they are
+  still established, even with SO_REUSEADDR, so the next server on that port
+  failed with \"bind() failed\"."
+  [port handler]
+  (let [fd (listen-socket port)
+        running? (atom true)
+        conns (atom #{})
+        stats (atom {:requests 0 :per-connection []})]
+    (future
+      (loop []
+        (let [raw (c-accept fd ffi/null ffi/null)]
+          (cond
+            (not @running?) nil
+            (neg? raw) (when @running? (recur))
+            :else (do (swap! conns conj raw)
+                      (future (try (persistent-serve raw handler stats running?)
+                                   (finally (swap! conns disj raw))))
+                      (recur))))))
+    {:fd fd :port port :running running? :stats stats :conns conns}))
+
+(defn start-keepalive
+  "A server that answers one complete, Content-Length-framed response and then
+  HOLDS the connection open — the shape of any peer that ignores our
+  `Connection: close`. A client that frames on the connection closing rather
+  than on Content-Length blocks here until its read timeout."
+  [port]
+  (let [fd (listen-socket port) running? (atom true)]
+    (future
+      (loop []
+        (let [raw (c-accept fd ffi/null ffi/null)]
+          (cond
+            (not @running?) nil
+            (neg? raw) (when @running? (recur))
+            :else
+            (do (future
+                  (try
+                    (net/recv-bytes raw)
+                    (net/send-bytes raw (latin1->ba "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"))
+                    (loop [n 0] (when (and @running? (< n 600)) (Thread/sleep 100) (recur (inc n))))
+                    (catch Throwable _ nil)
+                    (finally (try (net/close raw) (catch Throwable _ nil)))))
+                (recur))))))
+    {:fd fd :port port :running running?}))
 
 (defn start-tls
   ([port cert key] (start-tls port cert key {}))
@@ -197,8 +331,20 @@
                           (or handler default-handler) concurrent?))
      {:fd fd :port port :running running?})))
 
+(defn drop-connections!
+  "Close every accepted connection, leaving the listener up — a peer retiring
+  its idle keep-alive sockets."
+  [server]
+  (doseq [c (when-let [a (:conns server)] @a)]
+    (try (net/close c) (catch Throwable _ nil)))
+  nil)
+
 (defn stop [server]
   (reset! (:running server) false)
+  ;; accepted connections first: a persistent server's outlive the request that
+  ;; made them, and the port cannot be rebound while they are established
+  (doseq [c (when-let [a (:conns server)] @a)]
+    (try (net/close c) (catch Throwable _ nil)))
   (net/close (:fd server))
   nil)
 
@@ -317,17 +463,20 @@
   (conn-write conn (ws/encode-frame opcode payload {:mask? false})))
 
 (defn- ws-echo-loop [conn leftover]
-  (loop [buf leftover]
-    (if-let [[frame rest-bytes] (ws/decode-frame buf)]
+  ;; offset-based, like the client's reader: (byte-array (concat (seq buf) …))
+  ;; boxed a Byte per byte and recopied the whole buffer per read, which put the
+  ;; SERVER side of a large echo in the same quadratic hole as the client's.
+  (loop [buf leftover off 0]
+    (if-let [[frame next-off] (ws/decode-frame-at buf off)]
       (let [{:keys [opcode payload fin?]} frame]
         (cond
           (= opcode ws/op-close) (do (ws-send! conn ws/op-close payload) nil)
-          (= opcode ws/op-ping) (do (ws-send! conn ws/op-pong payload) (recur rest-bytes))
-          (= opcode ws/op-pong) (recur rest-bytes)
+          (= opcode ws/op-ping) (do (ws-send! conn ws/op-pong payload) (recur buf next-off))
+          (= opcode ws/op-pong) (recur buf next-off)
           :else (do (conn-write conn (ws/encode-frame opcode payload {:mask? false :fin? fin?}))
-                    (recur rest-bytes))))
+                    (recur buf next-off))))
       (if-let [chunk (conn-read conn)]
-        (recur (byte-array (concat (seq buf) (seq chunk))))
+        (recur (jolt.http.core/concat-bas [(jolt.http.core/sub-ba buf off (alength buf)) chunk]) 0)
         nil))))
 
 (defn websocket-handler

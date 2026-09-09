@@ -16,6 +16,7 @@
   send runs on jolt's own future pool). Each is recorded on the client and read
   back, so a caller that sets and inspects one sees what it set."
   (:require [clojure.string :as str]
+            [clojure.java.io]
             [jolt.crypto]                ;; java.security.SecureRandom (real, RAND_bytes)
             [jolt.http.core :as core]
             [jolt.http.net :as net]
@@ -140,18 +141,17 @@
       (toCompletableFuture [this] this))))
 
 (defn- cf-async
-  "Run thunk on jolt's future pool; the stage settles when it finishes. jolt's own
-  deref wraps a thrown exception in an ExecutionException — unwrap it, so a stage
-  always holds the cause and only the boundary wraps."
+  "Run thunk on jolt's future pool; the stage settles when it finishes.
+
+  One pool thread, not two. It used to run the thunk on one future and park a
+  second on its deref purely to unwrap the ExecutionException jolt's own deref
+  adds — but the inner future already catches Throwable and hands back a
+  {:v}/{:e} map, so it never throws and there was nothing to unwrap. The second
+  thread did nothing but wait, and halved how many :async requests a given pool
+  could have in flight."
   [thunk]
-  (let [c (cf-stage)
-        fut (future (try {:v (thunk)} (catch Throwable t {:e t})))]
-    (future (cf-settle! c (try @fut
-                               (catch Throwable t
-                                 {:e (if (and (instance? java.util.concurrent.ExecutionException t)
-                                              (ex-cause t))
-                                       (ex-cause t)
-                                       t)}))))
+  (let [c (cf-stage)]
+    (future (cf-settle! c (try {:v (thunk)} (catch Throwable t {:e t}))))
     c))
 
 (defn- cf-done [v] (doto (cf-stage) (cf-settle! {:v v})))
@@ -254,6 +254,46 @@
       (let [d (if (str/starts-with? domain ".") (subs domain 1) domain)]
         (or (= host d) (str/ends-with? host (str "." d)))))))
 
+(def ^:private months
+  {"jan" 1 "feb" 2 "mar" 3 "apr" 4 "may" 5 "jun" 6
+   "jul" 7 "aug" 8 "sep" 9 "oct" 10 "nov" 11 "dec" 12})
+
+(defn- days-from-civil
+  "Days since the epoch for a proleptic-Gregorian y/m/d (Howard Hinnant's
+  algorithm). java.time.format is not modelled here, and an Expires date is the
+  only thing a cookie needs a calendar for."
+  [y m d]
+  (let [y (if (<= m 2) (dec y) y)
+        era (quot (if (>= y 0) y (- y 399)) 400)
+        yoe (- y (* era 400))
+        doy (+ (quot (+ (* 153 (+ m (if (> m 2) -3 9))) 2) 5) (dec d))
+        doe (+ (* yoe 365) (quot yoe 4) (- (quot yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+
+(defn- parse-http-date
+  "An RFC 1123 / RFC 850 / asctime cookie Expires value as epoch milliseconds,
+  nil when it cannot be read. Cookie dates are always GMT."
+  [s]
+  (try
+    (let [toks (remove str/blank? (str/split (str s) #"[\s,]+"))
+          ;; "Wed 21 Oct 2015 07:28:00 GMT" or "Wed 21-Oct-2015 07:28:00 GMT"
+          toks (mapcat (fn [t] (str/split t #"-")) toks)
+          nums (filter #(re-matches #"\d{1,4}" %) toks)
+          time-tok (first (filter #(str/includes? % ":") toks))
+          mon (some (fn [t] (get months (str/lower-case (subs t 0 (min 3 (count t)))))) toks)
+          day (some (fn [t] (let [n (parse-long t)] (when (and n (<= 1 n 31)) n)))
+                    (filter #(<= (count %) 2) nums))
+          year (some (fn [t] (let [n (parse-long t)]
+                               (when n (cond (>= n 1000) n
+                                             (>= n 70) (+ 1900 n)
+                                             :else (+ 2000 n)))))
+                     (filter #(or (= 4 (count %)) (= 2 (count %))) nums))
+          [hh mm ss] (when time-tok (map parse-long (str/split time-tok #":")))]
+      (when (and mon day year hh)
+        (+ (* (days-from-civil year mon day) 86400000)
+           (* (or hh 0) 3600000) (* (or mm 0) 60000) (* (or ss 0) 1000))))
+    (catch Throwable _ nil)))
+
 (defn- parse-set-cookie [line]
   (let [parts (str/split (str line) #";")
         [nm v] (let [kv (first parts)
@@ -265,14 +305,26 @@
                           (if i
                             (assoc m (str/lower-case (str/trim (subs part 0 i))) (str/trim (subs part (inc i))))
                             (assoc m (str/lower-case part) true))))
-                      {} (rest parts))]
+                      {} (rest parts))
+        max-age (some-> (get attrs "max-age") parse-long)]
     (doto (tt :jolt.http/cookie)
       (tput! :name nm)
       (tput! :value v)
       (tput! :domain (get attrs "domain"))
       (tput! :path (or (get attrs "path") "/"))
       (tput! :secure (boolean (get attrs "secure")))
-      (tput! :max-age (some-> (get attrs "max-age") parse-long)))))
+      (tput! :max-age max-age)
+      ;; When a cookie stops being sent. RFC 6265 5.3: Max-Age wins over
+      ;; Expires, and Max-Age=0 is how a server DELETES a cookie — parsed but
+      ;; never read before, so a deleted cookie went on being sent forever.
+      (tput! :expires-at (cond
+                           max-age (+ (System/currentTimeMillis) (* 1000 max-age))
+                           (get attrs "expires") (parse-http-date (get attrs "expires"))
+                           :else nil)))))
+
+(defn- cookie-expired? [c]
+  (when-let [at (tget c :expires-at)]
+    (<= at (System/currentTimeMillis))))
 
 (defn- make-cookie-store []
   (doto (tt :jolt.http/cookie-store) (tput! :cookies (atom []))))
@@ -297,11 +349,18 @@
         (and (str/starts-with? rp cp)
              (or (str/ends-with? cp "/") (= \/ (get rp (count cp))))))))
 
-(defn- store-matching [store uri]
+(defn- store-matching
+  "The cookies this store will send for `uri`. `secure?` is whether the request
+  travels over TLS: java.net.CookieManager gates on `secureLink || !getSecure()`,
+  so a Secure cookie is withheld from a plaintext request, and its CookieStore
+  drops expired entries on the way out."
+  [store uri secure?]
   (let [host (host-of-uri uri)
         path (tget (core/parse-url (str uri)) :path)]
     (filter (fn [c] (and (cookie-domain-matches? host (tget c :domain))
-                         (cookie-path-matches? path (tget c :path))))
+                         (cookie-path-matches? path (tget c :path))
+                         (or secure? (not (tget c :secure)))
+                         (not (cookie-expired? c))))
             @(tget store :cookies))))
 
 (defn- make-cookie-manager [store policy]
@@ -326,7 +385,8 @@
     nil))
 
 (defn- cookie-manager-get [mgr uri _headers]
-  (let [cs (store-matching (tget mgr :store) uri)]
+  (let [cs (store-matching (tget mgr :store) uri
+                           (= "https" (tget (core/parse-url (str uri)) :protocol)))]
     (if (seq cs)
       {"Cookie" [(str/join "; " (map (fn [c] (str (tget c :name) "=" (tget c :value))) cs))]}
       {})))
@@ -413,6 +473,21 @@
   (let [low (str/lower-case nm)]
     (vec (remove (fn [p] (= low (str/lower-case (first p)))) pairs))))
 
+;; java.net.http refuses to let a caller set a header the client itself owns —
+;; measured against a JDK: content-length, connection, host, upgrade and expect
+;; all raise IllegalArgumentException("restricted header name: ..."), while
+;; date, via and anything custom go through. Without the check a caller's
+;; Content-Length joined ours on the wire as "Content-Length: 4, 4", which
+;; RFC 7230 3.3.3 makes an unrecoverable message framing error.
+(def ^:private restricted-headers
+  #{"connection" "content-length" "expect" "host" "upgrade"})
+
+(defn- check-header! [k]
+  (when (contains? restricted-headers (str/lower-case (str k)))
+    (throw-typed "java.lang.IllegalArgumentException"
+                 (str "restricted header name: \"" k "\"")))
+  nil)
+
 (defn- basic-auth-header [user pass]
   (str "Basic " (.encodeToString (java.util.Base64/getEncoder)
                                  (.getBytes (str user ":" pass) "UTF-8"))))
@@ -437,19 +512,54 @@
       (not (and (= "https" (tget from-url :protocol)) (= "http" (tget to-url :protocol))))
     :else false))
 
-(defn- exchange
-  "One request/response over a fresh connection. Returns the parsed response map."
-  [{:keys [url method headers body read-timeout conn-timeout insecure? proxy ssl deadline]}]
-  (let [https? (= "https" (tget url :protocol))
-        port (core/effective-port url)
-        [stream absolute?] (open-stream {:host (tget url :host) :port port :https? https?
-                                         :insecure? insecure? :read-timeout read-timeout
-                                         :conn-timeout conn-timeout :proxy proxy :ssl ssl})]
+(defn- exchange-once
+  "One request/response over `stream`. Releases the connection back to the pool
+  when the response says it may be kept, and closes it otherwise — including on
+  the way out of a failure, where the state of the connection is unknown.
+  `received` is set as soon as any response byte arrives."
+  [stream absolute? key {:keys [url method headers body deadline]} received]
+  (let [ok (atom false)]
     (try
       (core/s-write stream (core/build-request method url headers body
-                                               (when absolute? (tget url :spec))))
-      (core/parse-response (core/recv-all stream deadline))
-      (finally (try (core/s-close stream) (catch Throwable _ nil))))))
+                                               (when absolute? (core/spec-no-ref url))))
+      (let [resp (core/read-response stream deadline method received)]
+        (reset! ok (:reusable? resp))
+        resp)
+      (finally
+        (if @ok
+          (core/pool-release! key stream)
+          (try (core/s-close stream) (catch Throwable _ nil)))))))
+
+(defn- exchange
+  "One request/response, over a pooled connection when one is available.
+
+  A pooled connection the peer retired between requests looks exactly like a
+  live one until the exchange fails, and it fails differently depending on the
+  platform — a clean EOF where the peer sent FIN, a reset where it sent RST,
+  which is what Linux does when it closes a socket with unread data. Either way
+  the test is the same: did any response byte arrive? If none did, the peer
+  cannot have acted on the request, so it is retried on a fresh connection, and
+  that is safe even for a POST."
+  [{:keys [url method read-timeout conn-timeout insecure? proxy ssl] :as req}]
+  (let [https? (= "https" (tget url :protocol))
+        port (core/effective-port url)
+        host (tget url :host)
+        key (core/pool-key host port https? insecure? ssl proxy)
+        open! (fn [] (open-stream {:host host :port port :https? https?
+                                   :insecure? insecure? :read-timeout read-timeout
+                                   :conn-timeout conn-timeout :proxy proxy :ssl ssl}))
+        fresh! (fn [] (let [[stream absolute?] (open!)]
+                        (exchange-once stream absolute? key req (atom false))))]
+    (if-let [pooled (core/pool-acquire key)]
+      (let [received (atom false)]
+        (try
+          (core/set-stream-timeout! pooled read-timeout)
+          (exchange-once pooled (boolean (and proxy (not https?))) key req received)
+          (catch Throwable t
+            (if (and (not @received) (core/connection-gone? t))
+              (fresh!)
+              (throw t)))))
+      (fresh!))))
 
 (defn- request-headers
   "The wire headers for one hop: what the caller set, plus a Cookie header from
@@ -487,7 +597,11 @@
     (loop [uri start-uri
            url (core/parse-url (str start-uri))
            method (or (tget request :method) "GET")
-           body (when-let [bp (tget request :body)] (tget bp :bytes))
+           ;; An empty byte-array and nil are different requests: java.net.http
+           ;; sends `Content-Length: 0` for a POST/PUT built with
+           ;; BodyPublishers/noBody and nothing at all when there is no
+           ;; publisher, so the distinction has to survive to build-request.
+           body (when-let [bp (tget request :body)] (or (tget bp :bytes) (byte-array 0)))
            auth-header nil
            redirects 0
            retried-auth? false]
@@ -606,8 +720,10 @@
                     (loop [acc []]
                       (if (.hasMoreElements a) (recur (conj acc (.nextElement a))) acc))
                     (cons a more))]
-        (core/make-bais (reduce (fn [acc s] (core/concat-ba acc (core/->bytes s)))
-                                (byte-array 0) parts)))))
+        ;; one pass, not a fresh copy of everything per part: a multipart body
+        ;; is built out of a stream per field and re-concatenating each time is
+        ;; quadratic in the size of the upload
+        (core/make-bais (core/concat-bas (map core/->bytes parts))))))
 
   ;; --- java.nio.file.Files/probeContentType ---------------------------------
   ;; Content-type by extension. The JDK consults the platform's type database;
@@ -669,7 +785,7 @@
      "getCookieStore" (fn [self] (tget self :store))
      "setCookiePolicy" (fn [self p] (tput! self :policy p) nil)})
   (__register-class-methods! :jolt.http/cookie-store
-    {"getCookies" (fn [self] (vec @(tget self :cookies)))
+    {"getCookies" (fn [self] (vec (remove cookie-expired? @(tget self :cookies))))
      "getURIs" (fn [_self] [])
      "add" (fn [self uri c] (store-add! self uri c))
      "removeAll" (fn [self] (reset! (tget self :cookies) []) true)})
@@ -872,15 +988,19 @@
      "PUT"     (fn [self bp] (tput! self :method "PUT") (tput! self :body bp) self)
      "DELETE"  (fn [self] (tput! self :method "DELETE") self)
      "HEAD"    (fn [self] (tput! self :method "HEAD") self)
-     "header"  (fn [self k v] (tput! self :headers (conj (tget self :headers) [(str k) (str v)])) self)
+     "header"  (fn [self k v] (check-header! k)
+                 (tput! self :headers (conj (tget self :headers) [(str k) (str v)])) self)
      ;; setHeader replaces every existing value for the name; header appends.
      "setHeader" (fn [self k v]
+                   (check-header! k)
                    (tput! self :headers (conj (drop-header (tget self :headers) (str k)) [(str k) (str v)]))
                    self)
      ;; HttpRequest.Builder.headers(String...): a flat name/value array (babashka
      ;; passes (into-array String (coerce-headers headers))).
-     "headers" (fn [self arr] (tput! self :headers (into (tget self :headers)
-                                                         (map vec (partition 2 (vec arr)))))
+     "headers" (fn [self arr]
+                 (let [pairs (map vec (partition 2 (vec arr)))]
+                   (doseq [[k _] pairs] (check-header! k))
+                   (tput! self :headers (into (tget self :headers) pairs)))
                  self)
      "expectContinue" (fn [self _] self)   ; no-op; the socket path doesn't 100-continue
      "version" (fn [self v] (tput! self :version v) self)
@@ -927,9 +1047,14 @@
      "ofInputStream" (fn [supplier & _]
                        (doto (tt :jolt.http/body-bytes)
                          (tput! :bytes (core/->bytes (.get supplier)))))
+     ;; ofFile reads BYTES. It used to slurp the path, which decodes as text:
+     ;; every byte a UTF-8 decoder could not make sense of came back as U+FFFD
+     ;; and re-encoded wider, so a 256-byte binary file went out as 512 bytes of
+     ;; something else. Any file that is not valid UTF-8 text — an image, a zip,
+     ;; a protobuf — was silently corrupted.
      "ofFile"        (fn [path & _]
                        (doto (tt :jolt.http/body-bytes)
-                         (tput! :bytes (core/->bytes (slurp (str path))))))})
+                         (tput! :bytes (core/->bytes (clojure.java.io/input-stream (str path))))))})
   (__register-class-methods! :jolt.http/body-bytes
     {"contentLength" (fn [self] (if-let [b (tget self :bytes)] (alength b) 0))})
 

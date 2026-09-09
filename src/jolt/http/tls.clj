@@ -225,7 +225,9 @@
         (try (c-SSL-shutdown ssl) (catch Throwable _ nil))
         (try (net/close sock) (catch Throwable _ nil))
         (try (c-SSL-free ssl) (catch Throwable _ nil))
-        (try (c-SSL-CTX-free ctx) (catch Throwable _ nil))
+        ;; the SSL_CTX is NOT freed here: client contexts are shared out of
+        ;; ctx-cache and outlive any one connection. A server context is built
+        ;; per accept and freed by tls-wrap-server's own failure path.
         nil))
     st))
 
@@ -302,7 +304,7 @@
       (doseq [c (cons cert cas) :when c] (c-X509-STORE-add-cert store c))
       (finally (free)))))
 
-(defn- client-ctx
+(defn- build-client-ctx
   "A client SSL_CTX configured for `insecure?` and the caller's stores. A trust
   store REPLACES the platform CA set, the way a TrustManagerFactory over a
   truststore does on the JVM."
@@ -319,6 +321,36 @@
             (c-SSL-CTX-set-verify ctx VERIFY-PEER ffi/null)))
       ctx
       (catch Throwable e (c-SSL-CTX-free ctx) (throw e)))))
+
+;; A verifying SSL_CTX loads the platform CA bundle in
+;; SSL_CTX_set_default_verify_paths, and building one measured 5.7 ms against
+;; 0.09 ms for an insecure one — paid per REQUEST, since every connection built
+;; its own context. An SSL_CTX is designed to be shared across connections
+;; (SSL_new takes a reference), so contexts are cached by exactly what
+;; configures them: the verify mode and the caller's PKCS#12 material.
+;;
+;; The cache owns every context it hands out, which is why make-stream's close
+;; frees the SSL but not the SSL_CTX. Nothing evicts: the number of distinct
+;; TLS configurations in a process is the number of clients an app builds, not
+;; a function of how many requests it makes.
+(def ^:private ctx-cache (atom {}))
+
+(defn- ctx-key [insecure? ssl]
+  ;; the stores are byte-arrays; identity is what distinguishes two clients,
+  ;; and hashing megabytes of PKCS#12 per request would defeat the point
+  [(boolean insecure?)
+   (when-let [ks (:key-store ssl)] [(System/identityHashCode (:bytes ks)) (:pass ks)])
+   (when-let [ts (:trust-store ssl)] [(System/identityHashCode (:bytes ts)) (:pass ts)])])
+
+(defn- client-ctx [insecure? ssl]
+  (let [k (ctx-key insecure? ssl)]
+    (or (get @ctx-cache k)
+        ;; build outside the swap!, then let the first writer win and free the
+        ;; loser — swap! may retry, and an SSL_CTX built inside it would leak
+        (let [ctx (build-client-ctx insecure? ssl)
+              winner (get (swap! ctx-cache (fn [m] (if (contains? m k) m (assoc m k ctx)))) k)]
+          (when-not (= winner ctx) (c-SSL-CTX-free ctx))
+          winner))))
 
 (defn- start-client-session
   "Build the SSL object + memory BIOs for a client handshake over `sock`, run the
@@ -362,8 +394,8 @@
    (tls-connect host port insecure? read-timeout conn-timeout nil))
   ([host port insecure? read-timeout conn-timeout ssl]
    (let [ctx  (client-ctx insecure? ssl)
-         sock (try (net/connect host port conn-timeout)
-                   (catch Throwable e (c-SSL-CTX-free ctx) (throw e)))]
+         ;; no c-SSL-CTX-free on failure: ctx is shared out of the cache
+         sock (net/connect host port conn-timeout)]
      (net/set-read-timeout! sock read-timeout)
      (start-client-session ctx sock host insecure?))))
 

@@ -140,7 +140,14 @@
   / ConnectException-tagged throwable on failure."
   ([host port] (connect host port nil))
   ([host port timeout-ms]
-   (let [node    (ffi/string->ptr (str host))
+   (let [;; getaddrinfo wants the bare address; a URL carries an IPv6 literal
+         ;; bracketed ("[::1]") and java.net.URL/URI both report getHost() that
+         ;; way, so the brackets are stripped here rather than in the parser.
+         host    (let [h (str host)]
+                   (if (and (str/starts-with? h "[") (str/ends-with? h "]"))
+                     (subs h 1 (dec (count h)))
+                     h))
+         node    (ffi/string->ptr (str host))
          service (ffi/string->ptr (str port))
          respp   (ffi/alloc (ffi/sizeof :pointer))
          ;; hints: ai_socktype = SOCK_STREAM, else getaddrinfo also returns UDP
@@ -198,16 +205,21 @@
        (finally (ffi/free node) (ffi/free service) (ffi/free respp) (ffi/free hints))))))
 
 (defn set-read-timeout!
-  "Apply SO_RCVTIMEO of `ms` milliseconds to `fd` (a recv past it returns -1)."
+  "Apply SO_RCVTIMEO of `ms` milliseconds to `fd` (a recv past it returns -1).
+  nil or a non-positive `ms` CLEARS the timeout rather than leaving whatever was
+  there: a pooled connection outlives the request that opened it, and silently
+  carrying that request's timeout into the next one gave the caller a bound it
+  never asked for."
   [fd ms]
-  (when (and ms (pos? ms))
-    ;; struct timeval { time_t tv_sec; suseconds_t tv_usec; } — 16 bytes LP64.
-    (let [tv (ffi/alloc 16)]
-      (dotimes [i 16] (ffi/write tv :uint8 0 i))
-      (ffi/write tv :long (quot ms 1000) 0)
-      (ffi/write tv :long (* (rem ms 1000) 1000) 8)
-      (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
-      (ffi/free tv))))
+  ;; struct timeval { time_t tv_sec; suseconds_t tv_usec; } — 16 bytes LP64.
+  (let [ms (if (and ms (pos? ms)) ms 0)
+        tv (ffi/alloc 16)]
+    (dotimes [i 16] (ffi/write tv :uint8 0 i))
+    (ffi/write tv :long (quot ms 1000) 0)
+    (ffi/write tv :long (* (rem ms 1000) 1000) 8)
+    (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
+    (ffi/free tv)
+    nil))
 
 (def ^:private bufsize 65536)
 
@@ -313,6 +325,24 @@
             (= err eintr) (recur)
             :else (throw (recv-err-ex err)))))
       (finally (ffi/free buf)))))
+
+(defn idle-dead?
+  "True when an idle socket must not be reused: the peer has hung up, or has
+  sent something we never asked for. A pooled connection is idle by definition,
+  so anything readable on it is one or the other.
+
+  poll with a zero timeout, so this costs one syscall. It races — the peer can
+  close between the check and the write — which is why a pooled connection that
+  yields no response bytes at all is also retried on a fresh one."
+  [fd]
+  (let [pf (ffi/alloc 8)]
+    (try
+      (dotimes [i 8] (ffi/write pf :uint8 0 i))
+      (ffi/write pf :int fd 0)
+      (ffi/write pf :int po-pollin 4)
+      (not (zero? (c-poll pf 1 0)))
+      (catch Throwable _ true)
+      (finally (ffi/free pf)))))
 
 (defn send-bytes
   "Send all of byte-array `data` over `fd`."
