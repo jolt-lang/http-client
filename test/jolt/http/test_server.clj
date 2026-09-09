@@ -236,10 +236,10 @@
           (conn-write conn (latin1->ba "0\r\n\r\n")))
       (when (pos? (alength body)) (conn-write conn body)))))
 
-(defn- persistent-serve [conn handler stats]
+(defn- persistent-serve [conn handler stats running?]
   (try
     (loop [acc "" n 0]
-      (let [chunk (conn-read conn)]
+      (let [chunk (when @running? (conn-read conn))]
         (if (nil? chunk)
           (when (pos? n) (swap! stats update :per-connection conj n))
           (let [acc (str acc (ba->latin1 chunk))
@@ -249,12 +249,18 @@
               (let [req (parse-request acc)]
                 (if (< (- (count acc) (+ he 4)) (:content-length req))
                   (recur acc n)
-                  (let [resp (handler req)]
+                  ;; :request-number lets a handler behave differently on a
+                  ;; REUSED connection than on a fresh one, which is the only
+                  ;; way to drive the client's stale-connection retry on
+                  ;; purpose: answer the first request, hang up on the next.
+                  (let [resp (handler (assoc req :request-number n))]
                     (swap! stats update :requests inc)
-                    (write-persistent-response conn resp)
-                    (if (:close resp)
+                    (if (= :hangup resp)
                       (swap! stats update :per-connection conj (inc n))
-                      (recur (subs acc (+ he 4 (:content-length req))) (inc n)))))))))))
+                      (do (write-persistent-response conn resp)
+                          (if (:close resp)
+                            (swap! stats update :per-connection conj (inc n))
+                            (recur (subs acc (+ he 4 (:content-length req))) (inc n)))))))))))))
     (catch Throwable _ nil)
     (finally (try (conn-close conn) (catch Throwable _ nil)))))
 
@@ -263,10 +269,17 @@
   :per-connection [n …]} — one entry per connection that has finished, so a
   test can assert that several requests shared one socket. A handler may return
   :chunked true to frame the body with Transfer-Encoding, or :close true to ask
-  the client to hang up."
+  the client to hang up.
+
+  Accepted connections are tracked in :conns and closed by `stop`. Closing only
+  the listening socket is not enough for a server whose whole point is that
+  connections outlive a request: Linux refuses to rebind the port while they are
+  still established, even with SO_REUSEADDR, so the next server on that port
+  failed with \"bind() failed\"."
   [port handler]
   (let [fd (listen-socket port)
         running? (atom true)
+        conns (atom #{})
         stats (atom {:requests 0 :per-connection []})]
     (future
       (loop []
@@ -274,8 +287,11 @@
           (cond
             (not @running?) nil
             (neg? raw) (when @running? (recur))
-            :else (do (future (persistent-serve raw handler stats)) (recur))))))
-    {:fd fd :port port :running running? :stats stats}))
+            :else (do (swap! conns conj raw)
+                      (future (try (persistent-serve raw handler stats running?)
+                                   (finally (swap! conns disj raw))))
+                      (recur))))))
+    {:fd fd :port port :running running? :stats stats :conns conns}))
 
 (defn start-keepalive
   "A server that answers one complete, Content-Length-framed response and then
@@ -309,8 +325,20 @@
                           (or handler default-handler) concurrent?))
      {:fd fd :port port :running running?})))
 
+(defn drop-connections!
+  "Close every accepted connection, leaving the listener up — a peer retiring
+  its idle keep-alive sockets."
+  [server]
+  (doseq [c (when-let [a (:conns server)] @a)]
+    (try (net/close c) (catch Throwable _ nil)))
+  nil)
+
 (defn stop [server]
   (reset! (:running server) false)
+  ;; accepted connections first: a persistent server's outlive the request that
+  ;; made them, and the port cannot be rebound while they are established
+  (doseq [c (when-let [a (:conns server)] @a)]
+    (try (net/close c) (catch Throwable _ nil)))
   (net/close (:fd server))
   nil)
 

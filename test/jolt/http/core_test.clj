@@ -230,8 +230,10 @@
 ;; Connection reuse
 ;; ---------------------------------------------------------------------------
 
-(def ^:private pool-port 18150)
-(def ^:private pool-base (str "http://localhost:" pool-port))
+;; a port per test: these servers hold connections open by design, so one test's
+;; sockets must not still be established when the next one binds
+(def ^:private pool-ports (atom 18150))
+(defn- next-pool-port [] (swap! pool-ports inc))
 
 (defn- pool-handler [req]
   (let [uri (:uri req)]
@@ -241,16 +243,21 @@
       (= uri "/echo") {:status 200 :body (:body-raw req)}
       :else {:status 200 :body (str "ok " uri)})))
 
+(def ^:private ^:dynamic *pool-base* nil)
+
 (defn- with-pool-server
-  "Run `f` against a fresh keep-alive server on pool-port, with an empty pool
-  either side of it."
+  "Run `f` against a fresh keep-alive server on a port of its own, with an empty
+  pool either side of it. The pool is cleared BEFORE the server stops, so the
+  client ends of the connections it is holding are closed first."
   [f]
-  (let [s (srv/start-persistent pool-port pool-handler)]
+  (let [port (next-pool-port)
+        s (srv/start-persistent port pool-handler)]
     (core/pool-clear!)
-    (try (f s) (finally (srv/stop s) (core/pool-clear!)))))
+    (binding [*pool-base* (str "http://localhost:" port)]
+      (try (f s) (finally (core/pool-clear!) (srv/stop s))))))
 
 (defn- get! [path]
-  (let [conn (.openConnection (java.net.URL. (str pool-base path)))]
+  (let [conn (.openConnection (java.net.URL. (str *pool-base* path)))]
     {:status (.getResponseCode conn)
      :body (slurp (.getInputStream conn))}))
 
@@ -268,19 +275,40 @@
       (is (= "bye" (:body (get! "/close"))))
       (is (zero? (core/pool-count)))))))
 
+(defn- hangup-handler
+  "Answers the first request on a connection and hangs up on the next one
+  without replying — a peer retiring a socket exactly as the client reuses it,
+  which is the case the retry exists for."
+  [req]
+  (if (pos? (:request-number req)) :hangup {:status 200 :body "ok"}))
+
 (deftest a-retired-connection-is-retried
+  (testing "the peer hangs up once the reused request is already on the wire"
+    ;; the pooled socket is alive when it is taken, so the liveness check passes
+    ;; and only the retry can save this request
+    (let [port (next-pool-port)
+          s (srv/start-persistent port hangup-handler)]
+      (core/pool-clear!)
+      (binding [*pool-base* (str "http://localhost:" port)]
+        (try
+          (is (= "ok" (:body (get! "/first"))))
+          (is (= 1 (core/pool-count)))
+          (is (= "ok" (:body (get! "/second"))) "retried on a fresh connection")
+          ;; three requests reached the server for two the caller made: the
+          ;; first, the one it hung up on, and the retry
+          (is (= 3 (:requests @(:stats s))))
+          (finally (core/pool-clear!) (srv/stop s)))))))
+
+(deftest a-dead-connection-is-dropped-before-it-is-used
   (with-pool-server
    (fn [s]
     (is (= "ok /a" (:body (get! "/a"))))
     (is (= 1 (core/pool-count)))
-    ;; the server goes away and comes back: the pooled socket is dead, and the
-    ;; next request must not surface that to the caller
-    (srv/stop s)
-    (Thread/sleep 150)
-    (let [s2 (srv/start-persistent pool-port pool-handler)]
-      (try
-        (is (= "ok /b" (:body (get! "/b"))) "a dead pooled connection is replaced, not reported")
-        (finally (srv/stop s2)))))))
+    ;; the peer closes its end while the connection sits idle
+    (srv/drop-connections! s)
+    (Thread/sleep 100)
+    (is (= "ok /b" (:body (get! "/b"))) "the dead socket is replaced, not reported")
+    (is (= 1 (core/pool-count))))))
 
 (deftest pooling-can-be-switched-off
   (with-pool-server
@@ -315,21 +343,21 @@
 
 (deftest a-reused-connection-takes-the-new-requests-timeout
   ;; the pooled socket carries the SO_RCVTIMEO of whichever request opened it
-  (let [slow (srv/start-persistent 18151
+  (let [slow (srv/start-persistent (next-pool-port)
                                    (fn [req] (when (= "/slow" (:uri req)) (Thread/sleep 2000))
                                      {:status 200 :body "ok"}))]
     (core/pool-clear!)
     (try
       (testing "a first request with a generous timeout leaves a pooled connection"
-        (let [c (.openConnection (java.net.URL. "http://localhost:18151/fast"))]
+        (let [c (.openConnection (java.net.URL. (str "http://localhost:" (:port slow) "/fast")))]
           (.setReadTimeout c 10000)
           (is (= 200 (.getResponseCode c))))
         (is (= 1 (core/pool-count))))
       (testing "the next request's own, shorter timeout is the one that applies"
-        (let [c (.openConnection (java.net.URL. "http://localhost:18151/slow"))]
+        (let [c (.openConnection (java.net.URL. (str "http://localhost:" (:port slow) "/slow")))]
           (.setReadTimeout c 300)
           (is (thrown? java.net.SocketTimeoutException (.getResponseCode c)))))
-      (finally (srv/stop slow) (core/pool-clear!)))))
+      (finally (core/pool-clear!) (srv/stop slow)))))
 
 (deftest http-1-0-is-not-persistent-by-default
   (testing "a 1.0 response with a length is still not reusable"
