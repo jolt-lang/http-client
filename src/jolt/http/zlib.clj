@@ -93,3 +93,26 @@
 (defn gunzip       [src] (inflate-bytes src 47))
 (defn zlib-deflate [src] (deflate-bytes src 15))
 (defn zlib-inflate [src] (inflate-bytes src 15))
+(defn raw-deflate  [src] (deflate-bytes src -15))
+(defn raw-inflate  [src] (inflate-bytes src -15))
+
+(defn inflate-auto
+  "Decompress `src` whichever of the three framings it is in: zlib, gzip (both
+  auto-detected by libz from the header) or raw deflate (no header at all, so it
+  can only be found by trying it).
+
+  Servers advertising `Content-Encoding: deflate` send raw deflate about as often
+  as they send zlib, which is why java.util.zip callers all end up writing the
+  same probe-then-retry dance around `Inflater`. Doing it here means a caller
+  gets the body either way; the two framings are not mutually decodable, so
+  falling through cannot silently return the wrong bytes."
+  [src]
+  (try (inflate-bytes src 47)
+       (catch Throwable _
+         (try (inflate-bytes src -15)
+              (catch Throwable _
+                ;; java.util.zip reports a bad stream as ZipException, and
+                ;; callers catch exactly that class to decide the body was not
+                ;; compressed after all.
+                (throw (jolt.host/throwable "java.util.zip.ZipException"
+                                            "invalid deflate/zlib/gzip stream")))))))
