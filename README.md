@@ -74,6 +74,43 @@ send runs on jolt's own future pool. Each is recorded on the client and read
 back, so a caller that sets and inspects one sees what it set. WebSocket
 negotiates no extensions, so no `permessage-deflate`.
 
+Response bodies are read in full before the response is returned, so `:as
+:stream` hands back a stream over the complete body rather than a live one. It
+behaves like the JDK's for anything finite — `slurp`, `io/copy` and `io/reader`
+all work on it — but a response that never ends, such as an SSE feed, never
+returns. Restricted request headers behave as `java.net.http` does: setting
+`content-length`, `connection`, `host`, `upgrade` or `expect` on a request is an
+`IllegalArgumentException`, because the client owns them.
+
+## Connections
+
+Connections are pooled and reused per origin. HTTP/1.1 is persistent by default,
+so a request carries no `Connection: close` and the socket goes back to the pool
+when the response framed itself with `Content-Length` or chunked encoding and the
+server did not ask to close. Reuse is what makes a second request to the same
+host cost a round trip instead of a connect plus, for https, a full TLS
+handshake: ten sequential `https://example.com` GETs measured 308 ms pooled
+against 1184 ms without.
+
+A peer can retire a pooled connection between requests and nothing can rule that
+out in advance. Two things cover it: a socket the peer has already closed is
+detected and dropped before it is used, and a reused connection that answers with
+no bytes at all is retried once on a fresh one — a peer that never sent a byte
+never acted on the request, so even a `POST` is safe to retry there.
+
+The knobs live in `jolt.http.core`, and apply process-wide:
+
+```clojure
+(reset! jolt.http.core/pool-enabled? false)   ;; one connection per request
+(reset! jolt.http.core/pool-idle-ms 5000)     ;; how long an idle connection is kept
+(reset! jolt.http.core/pool-max-per-key 8)    ;; idle connections kept per origin
+(jolt.http.core/pool-clear!)                  ;; close and forget everything pooled
+```
+
+TLS contexts are shared too: an `SSL_CTX` is cached per client configuration
+rather than built per request, which matters because a verifying one loads the
+platform CA bundle (5.7 ms against 0.09 ms for `:insecure true`).
+
 ## Timeouts
 
 `:conn-timeout` and `:socket-timeout` are milliseconds, and both are off unless
@@ -118,11 +155,14 @@ request.
 
 ## Tests
 
-Five suites, each its own process — they bind their own ports and stand up their
+Six suites, each its own process — they bind their own ports and stand up their
 own servers. CI runs all of them except `:timeouttest`.
 
 ```
-jolt -M:test          # clj-http-lite's own client, links and integration suites,
+jolt -M:test          # the HTTP/1.1 engine itself (jolt.http.core-test: URL
+                      # parsing, RFC 3986 reference resolution, request
+                      # serialisation, response framing, connection reuse), plus
+                      # clj-http-lite's own client, links and integration suites,
                       # vendored under test/clj_http/lite, with in-process
                       # plaintext + TLS servers in place of the Jetty subprocess
 jolt -M:bhctest       # babashka.http-client, unmodified from Maven, over the
@@ -138,6 +178,11 @@ jolt -M:timeouttest   # timeout/deadline regressions; stalls connections on
                       # purpose. One case loads jolt.nrepl in a subprocess and
                       # fetches https://example.com, so it needs network egress.
 ```
+
+Values the suites assert on — the bytes `java.net.http` puts on the wire, what
+`java.net.URL`/`URI` getters return, what `java.net.URI/resolve` makes of a
+relative `Location`, which request headers the JDK refuses, and when a cookie is
+withheld — were measured against a real JDK rather than recalled.
 
 The `:bhctest` multipart case parses the body the client built with
 [jolt-lang/multipart](https://github.com/jolt-lang/multipart), so it asserts on

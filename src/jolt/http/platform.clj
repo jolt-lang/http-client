@@ -38,6 +38,7 @@
 (def connect-stream core/connect-stream)
 (def build-request core/build-request)
 (def parse-response core/parse-response)
+(def read-response core/read-response)
 (def recv-all core/recv-all)
 (def resolve-location core/resolve-location)
 (def redirect-statuses core/redirect-statuses)
@@ -61,13 +62,31 @@
          redirects 0]
     (let [https? (= "https" (tget url :protocol))
           body (when (and (tget conn :do-output) (tget conn :out-buffer)) (tget conn :out-buffer))
-          stream (connect-stream (tget url :host) (effective-port url) https?
-                                 (tget conn :insecure) (tget conn :read-timeout)
-                                 (tget conn :connect-timeout))
-          resp (try
-                 (s-write stream (build-request method url (tget conn :req-headers) body))
-                 (parse-response (recv-all stream))
-                 (finally (try (s-close stream) (catch Throwable _ nil))))
+          key (core/pool-key (tget url :host) (effective-port url) https?
+                             (tget conn :insecure) nil nil)
+          open! (fn [] (connect-stream (tget url :host) (effective-port url) https?
+                                       (tget conn :insecure) (tget conn :read-timeout)
+                                       (tget conn :connect-timeout)))
+          once (fn [stream]
+                 (let [ok (atom false)]
+                   (try
+                     (s-write stream (build-request method url (tget conn :req-headers) body))
+                     (let [r (read-response stream nil method)]
+                       (reset! ok (:reusable? r))
+                       r)
+                     (finally
+                       (if @ok
+                         (core/pool-release! key stream)
+                         (try (s-close stream) (catch Throwable _ nil)))))))
+          resp (if-let [pooled (core/pool-acquire key)]
+                 ;; a connection the peer retired since the last request answers
+                 ;; with nothing at all; that one case is retried fresh
+                 (try (once (core/set-stream-timeout! pooled (tget conn :read-timeout)))
+                      (catch Throwable t
+                        (if (= "class java.io.EOFException" (str (class t)))
+                          (once (open!))
+                          (throw t))))
+                 (once (open!)))
           loc (header-ci (:header-pairs resp) "location")]
       (if (and (tget conn :follow-redirects)
                (redirect-statuses (:status resp))
@@ -267,6 +286,7 @@
                             (str (or (tget self :path) "")
                                  (if (tget self :query) (str "?" (tget self :query)) ""))))
      "getQuery" (fn [self] (tget self :query))
+     "getRef" (fn [self] (tget self :ref))
      "getUserInfo" (fn [self] (tget self :userinfo))
      "toString" (fn [self] (tget self :spec))
      "toExternalForm" (fn [self] (tget self :spec))

@@ -22,6 +22,28 @@
 (def ^:private Z-FINISH 4)
 (def ^:private Z-NO-FLUSH 0)
 
+;; Output pieces are joined with one bulk copy each. (byte-array (mapcat seq
+;; chunks)) boxed a Byte per byte, which put a megabyte of decompressed body at
+;; ~200ms of pure allocation. Kept local rather than pulled from jolt.http.core:
+;; the :zlibtest suite runs this namespace with no sockets and no OpenSSL, and
+;; requiring core would drag both in.
+(def ^:private arraycopy?
+  (try (let [dst (byte-array 3)]
+         (System/arraycopy (byte-array [1 2 3]) 0 dst 0 3)
+         (= [1 2 3] (vec dst)))
+       (catch Throwable _ false)))
+
+(defn- join-chunks [chunks]
+  (let [out (byte-array (reduce (fn [n c] (+ n (alength c))) 0 chunks))]
+    (loop [cs (seq chunks) off 0]
+      (if cs
+        (let [c (first cs) len (alength c)]
+          (if arraycopy?
+            (System/arraycopy c 0 out off len)
+            (dotimes [i len] (aset out (+ off i) (aget c i))))
+          (recur (next cs) (+ off len)))
+        out))))
+
 (ffi/defcfn c-zlib-version "zlibVersion"   [] :pointer)
 (ffi/defcfn c-deflate-init "deflateInit2_" [:pointer :int :int :int :int :int :pointer :int] :int)
 (ffi/defcfn c-deflate      "deflate"       [:pointer :int] :int)
@@ -62,7 +84,7 @@
                   (= r Z-STREAM-END) acc
                   :else (recur acc))))]
         (c-deflate-end strm)
-        (byte-array (mapcat seq chunks)))
+        (join-chunks chunks))
       (finally (ffi/free strm) (ffi/free src-buf) (ffi/free out-buf)))))
 
 (defn inflate-bytes
@@ -86,7 +108,7 @@
                   (and (zero? produced) (zero? (ffi/read strm :uint O-avail-in))) acc
                   :else (recur acc))))]
         (c-inflate-end strm)
-        (byte-array (mapcat seq chunks)))
+        (join-chunks chunks))
       (finally (ffi/free strm) (ffi/free src-buf) (ffi/free out-buf)))))
 
 (defn gzip         [src] (deflate-bytes src 31))

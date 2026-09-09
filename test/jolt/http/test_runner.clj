@@ -9,6 +9,7 @@
   (:require [jolt.http.platform]                 ;; installs the host shims
             [clojure.test :as t]
             [jolt.http.stream-shim-test]
+            [jolt.http.core-test]
             [clj-http.lite.links-test]
             [clj-http.lite.client-test]
             [clj-http.lite.integration-test]))

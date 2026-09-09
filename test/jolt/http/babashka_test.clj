@@ -14,15 +14,22 @@
 
 (def ^:private port 18095)
 (def ^:private proxy-port 18096)
+(def ^:private keepalive-port 18097)
+(def ^:private v6-port 18098)
 (def ^:private base (str "http://localhost:" port))
+(def ^:private keepalive-base (str "http://localhost:" keepalive-port))
 
 (def ^:private servers (atom nil))
 
 (defn- with-servers [t]
   (let [s (srv/start-plain port {:handler routes/handler})
-        p (srv/start-proxy proxy-port)]
-    (reset! servers {:http s :proxy p})
-    (try (t) (finally (srv/stop s) (srv/stop p)))))
+        p (srv/start-proxy proxy-port)
+        ;; a peer that answers completely and then keeps the socket open, which
+        ;; is what any server ignoring our `Connection: close` looks like
+        k (srv/start-keepalive keepalive-port)
+        v6 (srv/start-plain v6-port {:handler routes/handler :host :ipv6})]
+    (reset! servers {:http s :proxy p :keepalive k :v6 v6})
+    (try (t) (finally (srv/stop s) (srv/stop p) (srv/stop k) (srv/stop v6)))))
 
 (use-fixtures :once with-servers)
 
@@ -353,6 +360,99 @@
     (is (.isPresent (.cookieHandler c)))
     (is (.isPresent (.authenticator c)))
     (is (.isPresent (.proxy c)))))
+
+(deftest wire-framing-and-headers
+  (testing "a URL fragment is not part of the request target"
+    (is (= "/echo-target" (:body (http/get (str base "/echo-target#somefrag"))))))
+  (testing "Content-Length by method, as java.net.http sends it"
+    ;; babashka hands every method a BodyPublisher, including GET, so the
+    ;; distinction has to come from the method — measured against a real JDK.
+    (doseq [[f expected] [[http/post "0"] [http/put "0"]
+                          [http/get nil] [http/head nil] [http/delete nil] [http/patch nil]]]
+      (is (= expected (header-line (:body (f (str base "/get"))) "content-length"))
+          (str f))))
+  (testing "a body always carries its own length"
+    (is (= "4" (header-line (:body (http/post (str base "/get") {:body "abcd"})) "content-length"))))
+  (testing "a caller's framing headers never double ours on the wire"
+    ;; java.net.http rejects these outright; both readings beat emitting
+    ;; "Content-Length: 4, 4", which RFC 7230 3.3.3 makes unrecoverable.
+    (is (thrown? IllegalArgumentException
+                 (http/post (str base "/get") {:body "abcd" :headers {"content-length" "4"}})))
+    (is (thrown? IllegalArgumentException
+                 (http/get (str base "/get") {:headers {"connection" "keep-alive"}})))
+    (is (thrown? IllegalArgumentException
+                 (http/get (str base "/get") {:headers {"host" "evil.example"}})))
+    (testing "an unrestricted header still goes through"
+      (is (= "v" (header-line (:body (http/get (str base "/get") {:headers {"x-custom" "v"}}))
+                              "x-custom"))))))
+
+(deftest relative-redirect-keeps-the-origin
+  (testing "Location: target from /deep/ resolves to /deep/target on the same port"
+    (let [r (http/get (str base "/deep/rel-redirect") {:follow-redirects :always})]
+      (is (= 200 (:status r)))
+      (is (= "deep-target" (:body r)))
+      (is (= (str base "/deep/target") (str (:uri r))))))
+  (testing "a dot-segment reference resolves against the base directory"
+    (let [r (http/get (str base "/deep/dot-redirect") {:follow-redirects :always})]
+      (is (= "root-target" (:body r))))))
+
+(deftest content-length-response-does-not-wait-for-close
+  (testing "a peer that answers and holds the socket open still completes"
+    (let [t0 (System/currentTimeMillis)
+          r (http/get (str keepalive-base "/x") {:timeout 8000})]
+      (is (= 200 (:status r)))
+      (is (= "hello" (:body r)))
+      (is (< (- (System/currentTimeMillis) t0) 4000)
+          "framed by Content-Length, not by the connection closing"))))
+
+(deftest file-bodies-are-bytes-not-text
+  (testing "a binary file body arrives byte for byte"
+    (let [f (java.io.File/createTempFile "jolt-http" ".bin")
+          payload (byte-array (map (fn [i] (byte (- (mod i 256) 128))) (range 1024)))]
+      (with-open [o (java.io.FileOutputStream. f)] (.write o payload))
+      (is (= 1024 (.contentLength (java.net.http.HttpRequest$BodyPublishers/ofFile (.toPath f)))))
+      (is (= (str "1024 " (reduce + 0 (map (fn [b] (bit-and b 0xff)) (seq payload))))
+             (:body (http/post (str base "/body-info") {:body f}))))))
+  (testing "a UTF-8 text file body is unchanged too"
+    (let [f (java.io.File/createTempFile "jolt-http" ".txt")
+          bs (.getBytes "héllo wörld" "UTF-8")]
+      (spit f "héllo wörld")
+      (is (= (str (alength bs) " " (reduce + 0 (map (fn [b] (bit-and b 0xff)) (seq bs))))
+             (:body (http/post (str base "/body-info") {:body f})))))))
+
+(deftest secure-cookies-stay-on-https
+  (testing "a Secure cookie is withheld from a plaintext request"
+    (let [c (http/client {:cookie-handler {:policy :accept-all}})]
+      (http/get (str base "/secure-cookie") {:client c})
+      (let [sent (:body (http/get (str base "/cookies") {:client c}))]
+        (is (not (str/includes? sent "sec=")) "Secure cookie went out over http")
+        (is (str/includes? sent "plain=1"))))))
+
+(deftest expired-cookies-are-not-sent
+  (testing "Max-Age=0 is how a server deletes a cookie"
+    (let [c (http/client {:cookie-handler {:policy :accept-all}})]
+      (http/get (str base "/set-cookie") {:client c})
+      (is (str/includes? (:body (http/get (str base "/cookies") {:client c})) "a=1"))
+      (http/get (str base "/expire-cookie") {:client c})
+      (is (not (str/includes? (:body (http/get (str base "/cookies") {:client c})) "a=1")))))
+  (testing "an Expires date in the past is equally dead on arrival"
+    (let [c (http/client {:cookie-handler {:policy :accept-all}})]
+      (http/get (str base "/past-cookie") {:client c})
+      (is (not (str/includes? (:body (http/get (str base "/cookies") {:client c})) "old="))))))
+
+(deftest ipv6-literal-url
+  (testing "an IPv6 literal host connects and names itself with brackets"
+    (let [r (http/get (str "http://[::1]:" v6-port "/get"))]
+      (is (= 200 (:status r)))
+      (is (= (str "[::1]:" v6-port) (header-line (:body r) "host"))))))
+
+(deftest large-response-throughput
+  (testing "an 8MB body is not assembled one boxed byte at a time"
+    (let [t0 (System/currentTimeMillis)
+          r (http/get (str base "/big") {:as :bytes})
+          took (- (System/currentTimeMillis) t0)]
+      (is (= (* 8 1024 1024) (alength (:body r))))
+      (is (< took 6000) (str "8MB took " took "ms")))))
 
 (defn -main [& _]
   (let [r (run-tests 'jolt.http.babashka-test)]
