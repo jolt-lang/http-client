@@ -41,13 +41,14 @@
 ;; choose between them.
 ;;
 ;; Probe the result instead: AI_CANONNAME is not requested below, so under the
-;; BSD layout the word at 24 is NULL, while under glibc it IS ai_addr — a
-;; sockaddr whose 16-bit family is AF_INET (2) or AF_INET6 (10), the only
-;; families this call asks for (SOCK_STREAM hints). Reading ai_addr at the
-;; wrong offset hands connect(2) a null or bogus sockaddr: every address fails
-;; with EFAULT (errno 14), which then reads as "connection refused" for the
-;; name. The layout cannot change while the process runs, so one probe is
-;; cached.
+;; BSD layout the word at 24 is NULL, while under glibc it IS ai_addr — and a
+;; sockaddr's leading 16-bit sa_family is by definition the same number the
+;; node already reports in ai_family. Comparing those two is what separates the
+;; layouts, and unlike a fixed AF_INET/AF_INET6 test it keeps holding whatever
+;; families the hints below go on to ask for. Reading ai_addr at the wrong
+;; offset hands connect(2) a null or bogus sockaddr: every address fails with
+;; EFAULT (errno 14), which then reads as "connection refused" for the name.
+;; The layout cannot change while the process runs, so one probe is cached.
 (def ^:private O-ai-family 4)
 (def ^:private O-ai-socktype 8)
 (def ^:private O-ai-protocol 12)
@@ -65,8 +66,8 @@
       (reset! ai-addr-offset-cache
               (let [p (ffi/read ai :pointer O-ai-addr-glibc)]
                 (if (and (not (ffi/null? p))
-                         (let [fam (ffi/read p :uint16 0)]
-                           (or (= fam 2) (= fam 10))))
+                         (= (ffi/read p :uint16 0)
+                            (ffi/read ai :int O-ai-family)))
                   O-ai-addr-glibc
                   O-ai-addr-bsd)))))
 
@@ -133,12 +134,13 @@
     (let [pf (ffi/alloc 8)]
       (try
         ;; struct pollfd { int fd; short events; short revents; } — 8 bytes LP64.
-        ;; jolt.ffi has no 16-bit type, so events and revents are set by one :int
-        ;; write: little-endian puts events in the low half, revents (already
-        ;; zeroed) in the high half.
+        ;; events is the 16-bit field at offset 4 and revents the one at 6, left
+        ;; zeroed for poll() to fill in. Writing events as a 16-bit value rather
+        ;; than packing both halves into one :int keeps this right on a
+        ;; big-endian host too.
         (dotimes [i 8] (ffi/write pf :uint8 0 i))
         (ffi/write pf :int fd 0)
-        (ffi/write pf :int po-pollout 4)
+        (ffi/write pf :uint16 po-pollout 4)
         (let [pr (c-poll pf 1 (int timeout-ms))]
           (cond
             ;; writable — the connect either completed or failed; SO_ERROR tells.
@@ -296,11 +298,11 @@
         deadline (when (pos? timeout) (+ (System/currentTimeMillis) timeout))
         pf       (ffi/alloc 8)]
     (try
-      ;; struct pollfd, as in timed-connect: events in the low half of the int
-      ;; at offset 4, revents zeroed in the high half.
+      ;; struct pollfd, as in timed-connect: events at offset 4, revents zeroed
+      ;; at 6.
       (dotimes [i 8] (ffi/write pf :uint8 0 i))
       (ffi/write pf :int fd 0)
-      (ffi/write pf :int po-pollin 4)
+      (ffi/write pf :uint16 po-pollin 4)
       (loop []
         (when (Thread/interrupted)
           (conn-ex "java.lang.InterruptedException" "read interrupted"))
@@ -367,7 +369,7 @@
     (try
       (dotimes [i 8] (ffi/write pf :uint8 0 i))
       (ffi/write pf :int fd 0)
-      (ffi/write pf :int po-pollin 4)
+      (ffi/write pf :uint16 po-pollin 4)
       (not (zero? (c-poll pf 1 0)))
       (catch Throwable _ true)
       (finally (ffi/free pf)))))
