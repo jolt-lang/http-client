@@ -33,14 +33,42 @@
 (def ^:private macos?
   (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "mac"))
 
-;; struct addrinfo field offsets (LP64). macOS swaps ai_canonname/ai_addr versus
-;; Linux, so ai_addr sits at 32 on macOS, 24 on Linux. ai_addrlen=16, ai_next=40.
+;; struct addrinfo field offsets (LP64). ai_addrlen=16, ai_next=40, and the
+;; ai_family/socktype/protocol words lead both layouts — but ai_addr's offset
+;; is a libc fact, not a platform constant. glibc orders ai_addr BEFORE
+;; ai_canonname (24); the BSD-derived libcs — macOS AND Android's bionic — put
+;; ai_canonname first (32). Android reports os.name "Linux", so os.name cannot
+;; choose between them.
+;;
+;; Probe the result instead: AI_CANONNAME is not requested below, so under the
+;; BSD layout the word at 24 is NULL, while under glibc it IS ai_addr — a
+;; sockaddr whose 16-bit family is AF_INET (2) or AF_INET6 (10), the only
+;; families this call asks for (SOCK_STREAM hints). Reading ai_addr at the
+;; wrong offset hands connect(2) a null or bogus sockaddr: every address fails
+;; with EFAULT (errno 14), which then reads as "connection refused" for the
+;; name. The layout cannot change while the process runs, so one probe is
+;; cached.
 (def ^:private O-ai-family 4)
 (def ^:private O-ai-socktype 8)
 (def ^:private O-ai-protocol 12)
 (def ^:private O-ai-addrlen 16)
-(def ^:private O-ai-addr (if macos? 32 24))
+(def ^:private O-ai-addr-glibc 24)
+(def ^:private O-ai-addr-bsd 32)
 (def ^:private O-ai-next 40)
+(def ^:private ai-addr-offset-cache (atom nil))
+
+(defn- ai-addr-offset
+  "ai_addr's offset in the struct addrinfo AI points at: 24 under glibc's
+   layout, 32 under the BSD one (macOS, Android/bionic)."
+  [ai]
+  (or @ai-addr-offset-cache
+      (reset! ai-addr-offset-cache
+              (let [p (ffi/read ai :pointer O-ai-addr-glibc)]
+                (if (and (not (ffi/null? p))
+                         (let [fam (ffi/read p :uint16 0)]
+                           (or (= fam 2) (= fam 10))))
+                  O-ai-addr-glibc
+                  O-ai-addr-bsd)))))
 
 ;; SOL_SOCKET / SO_RCVTIMEO / SO_ERROR differ by platform: macOS 0xffff / 0x1006 /
 ;; 0x1007, Linux 1 / 20 / 4.
@@ -177,7 +205,7 @@
                        sockt   (ffi/read ai :int O-ai-socktype)
                        proto   (ffi/read ai :int O-ai-protocol)
                        addrlen (ffi/read ai :int O-ai-addrlen)
-                       addr    (ffi/read ai :pointer O-ai-addr)
+                       addr    (ffi/read ai :pointer (ai-addr-offset ai))
                        fd      (c-socket fam sockt proto)]
                    (cond
                      (neg? fd) (recur (ffi/read ai :pointer O-ai-next) timed-out?)
