@@ -6,6 +6,7 @@
   (:require [jolt.http.platform]
             [babashka.http-client :as http]
             [babashka.http-client.interceptors :as interceptors]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [jolt.http.bhc-routes :as routes]
             [jolt.http.test-server :as srv]
@@ -453,6 +454,82 @@
           took (- (System/currentTimeMillis) t0)]
       (is (= (* 8 1024 1024) (alength (:body r))))
       (is (< took 6000) (str "8MB took " took "ms")))))
+
+
+;; --- streaming bodies (jolt-lang/jolt#1007, #1017) --------------------------
+;; /stream-ticks writes its headers at once and then one chunk every
+;; routes/tick-ms, so a client that reads the body to EOF before returning is
+;; visible as a call that takes the whole run, and a total deadline over the body
+;; is visible as a stream that dies partway through.
+
+(def ^:private ticks-ms (* routes/tick-count routes/tick-ms))
+
+(deftest stream-body-returns-when-the-headers-arrive
+  (testing "ofInputStream hands back the response at the headers, not at EOF"
+    (let [t0 (System/currentTimeMillis)
+          r (http/get (str base "/stream-ticks") {:as :stream})
+          headers-at (- (System/currentTimeMillis) t0)]
+      (is (= 200 (:status r)))
+      (is (< headers-at (quot ticks-ms 2))
+          (str "the call returned after " headers-at "ms; the body runs for " ticks-ms "ms"))
+      (is (= routes/ticks-body (slurp (:body r))))
+      (is (>= (- (System/currentTimeMillis) t0) (* (dec routes/tick-count) routes/tick-ms))
+          "the whole body really was still arriving"))))
+
+(deftest stream-body-arrives-a-piece-at-a-time
+  (testing "a reader over the body yields each line as it comes off the wire"
+    (let [r (http/get (str base "/stream-ticks") {:as :stream})
+          rdr (java.io.BufferedReader. (io/reader (:body r)))
+          t0 (System/currentTimeMillis)
+          first-line (.readLine rdr)
+          first-at (- (System/currentTimeMillis) t0)
+          _ (dotimes [_ (- routes/tick-count 2)] (.readLine rdr))
+          last-line (.readLine rdr)
+          last-at (- (System/currentTimeMillis) t0)]
+      (is (= "tick 0" first-line))
+      (is (= (str "tick " (dec routes/tick-count)) last-line))
+      (is (< first-at (- last-at routes/tick-ms))
+          (str "first line at " first-at "ms, last at " last-at "ms — all at once")))))
+
+(deftest stream-body-outlives-the-request-timeout
+  (testing ":timeout bounds the time to the response, and does not cut a body in flight"
+    ;; jolt-lang/jolt#1017. On the JVM java.net.http's HttpRequest.timeout does
+    ;; not end a body that is still arriving; a total deadline over the body
+    ;; killed every stream that ran longer than it.
+    (let [r (http/get (str base "/stream-ticks") {:as :stream :timeout (quot ticks-ms 2)})]
+      (is (= 200 (:status r)))
+      (is (= routes/ticks-body (slurp (:body r)))))))
+
+(deftest stream-body-closed-early
+  (testing "closing a partly-read body gives the connection up and reads as EOF"
+    (let [r (http/get (str base "/stream-ticks") {:as :stream})
+          body (:body r)
+          buf (byte-array 32)]
+      (is (pos? (.read body buf 0 32)))
+      (.close body)
+      (is (= -1 (.read body buf 0 32))))))
+
+(deftest stream-body-marks-and-resets
+  (testing "mark/reset replay what was read, which is what deflate detection needs"
+    (let [body (:body (http/get (str base "/stream-ticks") {:as :stream}))
+          buf (byte-array 6)]
+      (.mark body 512)
+      (.read body buf 0 6)
+      (is (= "tick 0" (String. buf 0 6 "UTF-8")))
+      (.reset body)
+      (is (= routes/ticks-body (slurp body))))))
+
+(deftest stream-body-of-an-empty-response
+  (testing "a body with nothing in it still reads as an empty stream"
+    (let [r (http/get (str base "/no-content") {:as :stream})]
+      (is (= 204 (:status r)))
+      (is (= "" (slurp (:body r)))))))
+
+(deftest stream-body-through-a-redirect
+  (testing "the intermediate body is drained and the final one is the live stream"
+    (let [r (http/get (str base "/redirect/3") {:as :stream})]
+      (is (= 200 (:status r)))
+      (is (= "200 OK" (slurp (:body r)))))))
 
 (defn -main [& _]
   (let [r (run-tests 'jolt.http.babashka-test)]

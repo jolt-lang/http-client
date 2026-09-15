@@ -4,7 +4,15 @@
   status codes, auth challenges, cookies). Plain text rather than JSON — the
   assertions are about the HTTP client, not about a JSON codec."
   (:require [clojure.string :as str]
+            [jolt.http.core :as core]
+            [jolt.http.test-server :as srv]
             [jolt.http.zlib :as zlib]))
+
+;; /stream-ticks: how long the body takes to arrive, and in how many pieces.
+;; Read by the streaming tests, which assert against these.
+(def tick-count 8)
+(def tick-ms 120)
+(def ticks-body (apply str (map (fn [i] (str "tick " i "\n")) (range tick-count))))
 
 ;; built once: (byte-array (repeat n …)) walks a boxed seq, and paying that per
 ;; request would put the server, not the client, in the throughput measurement
@@ -102,6 +110,23 @@
        :body body}
 
       (= uri "/slow") (do (Thread/sleep 1500) {:status 200 :body "slow"})
+
+      ;; A body that arrives over time: the headers go out at once and each tick
+      ;; as it is produced, which is what an SSE endpoint looks like. Hijacks the
+      ;; connection, because write-response serialises one finished response.
+      (= uri "/stream-ticks")
+      (let [conn (:conn req)
+            send (fn [s] (srv/conn-write conn (core/latin1->ba s)))]
+        (send (str "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: text/event-stream\r\n"
+                   "Transfer-Encoding: chunked\r\n\r\n"))
+        (dotimes [i tick-count]
+          (let [payload (str "tick " i "\n")]
+            (send (str (Integer/toHexString (count payload)) "\r\n" payload "\r\n")))
+          (Thread/sleep tick-ms))
+        (send "0\r\n\r\n")
+        (srv/conn-close conn)
+        :hijacked)
 
       (= uri "/redirect-to")
       {:status 302 :headers {"location" (second (str/split (str (:query req)) #"url="))} :body ""}
