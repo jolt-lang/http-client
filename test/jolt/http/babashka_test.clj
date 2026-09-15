@@ -6,7 +6,9 @@
   (:require [jolt.http.platform]
             [babashka.http-client :as http]
             [babashka.http-client.interceptors :as interceptors]
+            [clojure.java.io :as io]
             [clojure.string :as str]
+            [jolt.http.core :as core]
             [jolt.http.bhc-routes :as routes]
             [jolt.http.test-server :as srv]
             [multipart.core :as multipart]
@@ -453,6 +455,179 @@
           took (- (System/currentTimeMillis) t0)]
       (is (= (* 8 1024 1024) (alength (:body r))))
       (is (< took 6000) (str "8MB took " took "ms")))))
+
+
+;; --- streaming bodies (jolt-lang/jolt#1007, #1017) --------------------------
+;; /stream-ticks writes its headers at once and then one chunk every
+;; routes/tick-ms, so a client that reads the body to EOF before returning is
+;; visible as a call that takes the whole run, and a total deadline over the body
+;; is visible as a stream that dies partway through.
+
+(def ^:private ticks-ms (* routes/tick-count routes/tick-ms))
+
+;; Whether this jolt can carry a LIVE body. The stream is a reify
+;; java.io.InputStream, which needs the abstract-class method inheritance jolt
+;; gained in v0.8.8; on an older one the transport probes that, finds it missing
+;; and keeps the buffered path. deps.edn's floor is 0.8.1, so both are supported
+;; and both are tested — the cases below assert whichever contract is in force,
+;; which is also what documents the difference between them.
+(def ^:private live? core/reify-input-streams?)
+
+(deftest stream-body-returns-when-the-headers-arrive
+  (testing "ofInputStream hands back the response at the headers, not at EOF"
+    (let [t0 (System/currentTimeMillis)
+          r (http/get (str base "/stream-ticks") {:as :stream})
+          headers-at (- (System/currentTimeMillis) t0)]
+      (is (= 200 (:status r)))
+      (if live?
+        (is (< headers-at (quot ticks-ms 2))
+            (str "the call returned after " headers-at "ms; the body runs for " ticks-ms "ms"))
+        (is (>= headers-at (* (dec routes/tick-count) routes/tick-ms))
+            "the buffered fallback waits for the whole body, as it always did"))
+      (is (= routes/ticks-body (slurp (:body r))))
+      (is (>= (- (System/currentTimeMillis) t0) (* (dec routes/tick-count) routes/tick-ms))
+          "the whole body really was still arriving"))))
+
+(deftest stream-body-ends-at-the-body-not-at-the-close
+  (testing "the terminal chunk ends the stream; the route holds the socket open after it"
+    (let [t0 (System/currentTimeMillis)
+          r (http/get (str base "/stream-ticks") {:as :stream})
+          body (slurp (:body r))
+          took (- (System/currentTimeMillis) t0)]
+      (is (= routes/ticks-body body))
+      ;; the route sleeps 1500ms after the terminal chunk before closing
+      (is (< took (+ ticks-ms 750))
+          (str "took " took "ms — waited for the close rather than for the body")))))
+
+(defn- scripted-stream
+  "A core stream whose reads hand back `blocks` in order, one per read, then EOF.
+  One block is one arrival off the wire, which is the only way to put a chunked
+  message's trailer in a segment of its own."
+  [blocks]
+  (let [left (atom (vec blocks))
+        st (core/tt :test/stream)]
+    (core/tput! st :read (fn [& _] (let [b (first @left)]
+                                     (swap! left subvec (min 1 (count @left)))
+                                     (when b (core/latin1->ba b)))))
+    (core/tput! st :write (fn [& _] nil))
+    (core/tput! st :close (fn [& _] nil))
+    st))
+
+(defn- pulled [resp]
+  (String. (core/concat-bas (take-while some? (repeatedly (:body-pull resp)))) "UTF-8"))
+
+(deftest streamed-framings
+  (testing "a live body is framed the way the response says it is"
+    (when live?
+      (testing "Content-Length, across several arrivals"
+        (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhel"
+                                   "lo "
+                                   "worldLEFTOVER"])
+              resp (core/read-response st nil "GET" nil true)]
+          (is (= "hello world" (pulled resp)))
+          (is (:reusable? resp) "a Content-Length body says where it ends")))
+      (testing "chunked"
+        (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                   "3\r\nhel\r\n"
+                                   "8\r\nlo world\r\n"
+                                   "0\r\n\r\n"])
+              resp (core/read-response st nil "GET" nil true)]
+          (is (= "hello world" (pulled resp)))
+          (is (:reusable? resp))))
+      (testing "no framing at all: the peer's close is the delimiter"
+        (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello"
+                                   " world"])
+              resp (core/read-response st nil "GET" nil true)]
+          (is (= "hello world" (pulled resp)))
+          (is (not (:reusable? resp)) "read-to-close framing IS the close")))
+      (testing "a body that ends early is a truncated response, not a short one"
+        (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello"])
+              resp (core/read-response st nil "GET" nil true)]
+          (is (thrown? java.io.IOException (pulled resp))))))))
+
+(deftest chunked-trailers-are-consumed
+  (testing "a trailer that arrives after the terminal chunk is taken off the wire"
+    ;; A connection is reusable after a chunked body, so anything left of this
+    ;; message would be read as the start of the NEXT response on it. The trailer
+    ;; is only ever LEFT when it arrives in a segment of its own — one already in
+    ;; the buffer is dropped with the buffer — hence a block per arrival here.
+    (doseq [streaming? (if live? [true false] [false])]
+      (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                 "5\r\nhello\r\n"
+                                 "0\r\n"
+                                 "X-Tick-Count: 8\r\n\r\n"
+                                 "HTTP/1.1 204 No Content\r\n\r\n"])
+            resp (core/read-response st nil "GET" nil streaming?)]
+        (is (:reusable? resp))
+        (is (= "hello" (if streaming? (pulled resp) (String. ^bytes (:body resp) "UTF-8"))))
+        ;; what the next request on this connection would read first
+        (is (= 204 (:status (core/read-response st))))))))
+
+(deftest stream-body-arrives-a-piece-at-a-time
+  (testing "a reader over the body yields each line as it comes off the wire"
+    (let [r (http/get (str base "/stream-ticks") {:as :stream})
+          rdr (java.io.BufferedReader. (io/reader (:body r)))
+          t0 (System/currentTimeMillis)
+          first-line (.readLine rdr)
+          first-at (- (System/currentTimeMillis) t0)
+          _ (dotimes [_ (- routes/tick-count 2)] (.readLine rdr))
+          last-line (.readLine rdr)
+          last-at (- (System/currentTimeMillis) t0)]
+      (is (= "tick 0" first-line))
+      (is (= (str "tick " (dec routes/tick-count)) last-line))
+      (if live?
+        (is (< first-at (- last-at routes/tick-ms))
+            (str "first line at " first-at "ms, last at " last-at "ms — all at once"))
+        (is (= first-at last-at)
+            "the buffered fallback has the whole body before the first line")))))
+
+(deftest stream-body-outlives-the-request-timeout
+  (testing ":timeout bounds the time to the response, and does not cut a body in flight"
+    ;; jolt-lang/jolt#1017. On the JVM java.net.http's HttpRequest.timeout does
+    ;; not end a body that is still arriving; a total deadline over the body
+    ;; killed every stream that ran longer than it. The buffered fallback still
+    ;; applies that deadline to the whole response, which is the divergence
+    ;; itself — asserted here rather than left implied.
+    (let [get! #(http/get (str base "/stream-ticks") {:as :stream :timeout (quot ticks-ms 2)})]
+      (if live?
+        (let [r (get!)]
+          (is (= 200 (:status r)))
+          (is (= routes/ticks-body (slurp (:body r)))))
+        (is (thrown? java.net.SocketTimeoutException (get!)))))))
+
+(deftest stream-body-closed-early
+  (testing "closing a partly-read body gives the connection up and reads as EOF"
+    (let [r (http/get (str base "/stream-ticks") {:as :stream})
+          body (:body r)
+          buf (byte-array 32)]
+      (is (pos? (.read body buf 0 32)))
+      (.close body)
+      (if live?
+        (is (= -1 (.read body buf 0 32)))
+        ;; a ByteArrayInputStream over an already-read body throws instead
+        (is (thrown? java.io.IOException (.read body buf 0 32)))))))
+
+(deftest stream-body-marks-and-resets
+  (testing "mark/reset replay what was read, which is what deflate detection needs"
+    (let [body (:body (http/get (str base "/stream-ticks") {:as :stream}))
+          buf (byte-array 6)]
+      (.mark body 512)
+      (.read body buf 0 6)
+      (is (= "tick 0" (String. buf 0 6 "UTF-8")))
+      (.reset body)
+      (is (= routes/ticks-body (slurp body))))))
+
+(deftest stream-body-of-an-empty-response
+  (testing "a body with nothing in it still reads as an empty stream"
+    (let [r (http/get (str base "/no-content") {:as :stream})]
+      (is (= 204 (:status r)))
+      (is (= "" (slurp (:body r)))))))
+
+(deftest stream-body-through-a-redirect
+  (testing "the intermediate body is drained and the final one is the live stream"
+    (let [r (http/get (str base "/redirect/3") {:as :stream})]
+      (is (= 200 (:status r)))
+      (is (= "200 OK" (slurp (:body r)))))))
 
 (defn -main [& _]
   (let [r (run-tests 'jolt.http.babashka-test)]
