@@ -454,6 +454,70 @@
       (is (= (* 8 1024 1024) (alength (:body r))))
       (is (< took 6000) (str "8MB took " took "ms")))))
 
+;; --- live response bodies (gh-1007) ----------------------------------------
+;; `:as :stream` used to hand back a ByteArrayInputStream over a body that had
+;; already been read to EOF, so the CALL did not return until the body ended —
+;; and for a body that does not end (an SSE stream, a log tail) it never did.
+;; These read with .readLine rather than line-seq so they assert on the
+;; transport alone, whatever the host's line-seq does with a live reader.
+
+(defn- elapsed-lines
+  "Read `n` lines off `rdr`, returning [line elapsed-ms] for each."
+  [rdr n t0]
+  (vec (for [_ (range n)]
+         (let [l (.readLine rdr)] [l (- (System/currentTimeMillis) t0)]))))
+
+(deftest stream-body-returns-before-the-body-ends
+  (testing "a trickling body is handed over live, not after it finishes"
+    (let [t0 (System/currentTimeMillis)
+          r (http/get (str base "/trickle") {:as :stream})
+          returned (- (System/currentTimeMillis) t0)
+          rdr (clojure.java.io/reader (:body r))
+          lines (elapsed-lines rdr 3 t0)]
+      (is (= 200 (:status r)))
+      ;; the three events span ~750ms; returning must not have waited for them
+      (is (< returned 200) (str "the call returned only after " returned "ms"))
+      (is (= ["data: tick 0" "data: tick 1" "data: tick 2"] (mapv first lines)))
+      ;; …and each event became readable when it was SENT: the first long before
+      ;; the third, which is the difference between a live body and a buffered
+      ;; one handed over once it was complete
+      (is (< (second (first lines)) 200)
+          (str "the first event waited for the rest: " (pr-str lines)))
+      (is (> (second (last lines)) 400)
+          (str "events did not arrive over time: " (pr-str lines))))))
+
+(deftest stream-body-chunked-ends-at-the-terminal-chunk
+  (testing "a chunked live body ends without waiting for the peer to close"
+    (let [t0 (System/currentTimeMillis)
+          r (http/get (str base "/trickle-chunked") {:as :stream})
+          rdr (clojure.java.io/reader (:body r))
+          lines (elapsed-lines rdr 3 t0)]
+      (is (= 200 (:status r)))
+      (is (= ["data: tick 0" "data: tick 1" "data: tick 2"] (mapv first lines)))
+      ;; the server holds the socket for another second after the terminal
+      ;; chunk; end-of-body must be the chunk, so this returns nil well before
+      (is (nil? (.readLine rdr)))
+      (is (< (- (System/currentTimeMillis) t0) 1500)
+          "the body ended on the peer's close rather than on its terminal chunk"))))
+
+(deftest stream-body-delivers-the-same-bytes
+  (testing "a Content-Length body streams byte for byte"
+    (is (= (:body (http/get (str base "/get")))
+           (slurp (:body (http/get (str base "/get") {:as :stream}))))))
+  (testing "an 8MB body survives the many reads it takes to stream it"
+    (let [in (:body (http/get (str base "/big") {:as :stream}))
+          got (.readAllBytes in)]
+      (is (= (* 8 1024 1024) (alength got)))
+      (is (every? #(= 65 %) (take 1000 (map #(bit-and % 0xff) got)))))))
+
+(deftest stream-body-supports-mark-and-reset
+  (testing "a live body can be rewound, which is what deflate sniffing needs"
+    (let [in (:body (http/get (str base "/get") {:as :stream}))]
+      (.mark in 512)
+      (let [a (.readNBytes in 8)]
+        (.reset in)
+        (is (= (vec a) (vec (.readNBytes in 8))))))))
+
 (defn -main [& _]
   (let [r (run-tests 'jolt.http.babashka-test)]
     (println (str "\n========== babashka.http-client =========="))

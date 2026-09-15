@@ -4,7 +4,28 @@
   status codes, auth challenges, cookies). Plain text rather than JSON — the
   assertions are about the HTTP client, not about a JSON codec."
   (:require [clojure.string :as str]
+            [jolt.http.test-server :as srv]
             [jolt.http.zlib :as zlib]))
+
+(defn- latin1 [s] (.getBytes ^String s "ISO-8859-1"))
+
+(defn- trickle!
+  "Hijack the connection and dribble `n` events out with `gap` ms between them,
+  so a client reading the body sees it arrive rather than all at once. `frame`
+  wraps one event's text for the wire; `tail`, when given, closes the message
+  off, and `hold` is how long the socket then stays open — a hijacked handler
+  owns the close, so this is what decides whether the peer's close and the end
+  of the body are the same event."
+  [conn head frame tail n gap hold]
+  (let [send! (fn [s] (srv/conn-write conn (latin1 s)))]
+    (send! head)
+    (dotimes [i n]
+      (send! (frame (str "data: tick " i "\n")))
+      (Thread/sleep gap))
+    (when tail (send! tail))
+    (when (pos? hold) (Thread/sleep hold))
+    (srv/conn-close conn)
+    :hijacked))
 
 ;; built once: (byte-array (repeat n …)) walks a boxed seq, and paying that per
 ;; request would put the server, not the client, in the throughput measurement
@@ -29,6 +50,26 @@
       (= uri "/body-info")
       {:status 200 :body (str (count body) " " (reduce + 0 (map int body)))}
       (= uri "/big") {:status 200 :body big-body}
+
+      ;; --- bodies that arrive over time (gh-1007) -----------------------------
+      ;; A live stream is the one body a client cannot read to completion before
+      ;; handing it over, so these hold the connection open between events. Both
+      ;; framings, because they end differently: /trickle ends when the peer
+      ;; closes, /trickle-chunked at its terminal chunk — and that one then HOLDS
+      ;; the socket open, so a client that mistook close for end-of-body would
+      ;; hang instead of finishing.
+      (= uri "/trickle")
+      (trickle! (:conn req)
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+                identity
+                nil 3 250 0)
+
+      (= uri "/trickle-chunked")
+      (trickle! (:conn req)
+                (str "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                     "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n")
+                (fn [ev] (str (Integer/toHexString (count ev)) "\r\n" ev "\r\n"))
+                "0\r\n\r\n" 3 250 1000)
 
       ;; a Location with no leading slash: resolves against the base directory
       (= uri "/deep/rel-redirect") {:status 302 :headers {"location" "target"} :body ""}
