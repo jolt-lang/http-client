@@ -513,6 +513,38 @@
     (core/tput! st :close (fn [& _] nil))
     st))
 
+(defn- pulled [resp]
+  (String. (core/concat-bas (take-while some? (repeatedly (:body-pull resp)))) "UTF-8"))
+
+(deftest streamed-framings
+  (testing "a live body is framed the way the response says it is"
+    (when live?
+      (testing "Content-Length, across several arrivals"
+        (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhel"
+                                   "lo "
+                                   "worldLEFTOVER"])
+              resp (core/read-response st nil "GET" nil true)]
+          (is (= "hello world" (pulled resp)))
+          (is (:reusable? resp) "a Content-Length body says where it ends")))
+      (testing "chunked"
+        (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                   "3\r\nhel\r\n"
+                                   "8\r\nlo world\r\n"
+                                   "0\r\n\r\n"])
+              resp (core/read-response st nil "GET" nil true)]
+          (is (= "hello world" (pulled resp)))
+          (is (:reusable? resp))))
+      (testing "no framing at all: the peer's close is the delimiter"
+        (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello"
+                                   " world"])
+              resp (core/read-response st nil "GET" nil true)]
+          (is (= "hello world" (pulled resp)))
+          (is (not (:reusable? resp)) "read-to-close framing IS the close")))
+      (testing "a body that ends early is a truncated response, not a short one"
+        (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello"])
+              resp (core/read-response st nil "GET" nil true)]
+          (is (thrown? java.io.IOException (pulled resp))))))))
+
 (deftest chunked-trailers-are-consumed
   (testing "a trailer that arrives after the terminal chunk is taken off the wire"
     ;; A connection is reusable after a chunked body, so anything left of this
@@ -527,10 +559,7 @@
                                  "HTTP/1.1 204 No Content\r\n\r\n"])
             resp (core/read-response st nil "GET" nil streaming?)]
         (is (:reusable? resp))
-        (is (= "hello" (if streaming?
-                         (String. (core/concat-bas (take-while some? (repeatedly (:body-pull resp))))
-                                  "UTF-8")
-                         (String. ^bytes (:body resp) "UTF-8"))))
+        (is (= "hello" (if streaming? (pulled resp) (String. ^bytes (:body resp) "UTF-8"))))
         ;; what the next request on this connection would read first
         (is (= 204 (:status (core/read-response st))))))))
 
