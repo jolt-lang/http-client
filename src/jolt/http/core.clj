@@ -532,6 +532,33 @@
                 (sub-ba b remaining n))))
         (throw-typed "java.io.IOException" "connection closed mid-body")))))
 
+(defn- crlf-line
+  "The next CRLF-terminated line at `pos`, reading as needed. Returns
+  [line buf pos-after-the-CRLF]."
+  [stream buf pos deadline]
+  (let [[buf pos] (loop [buf buf pos pos]
+                    (if (index-of-crlf buf pos)
+                      [buf pos]
+                      (if-let [b (read-more! stream deadline)]
+                        (recur (concat-bas [(sub-ba buf pos (alength buf)) b]) 0)
+                        (throw-typed "java.io.IOException" "connection closed mid-chunk"))))
+        crlf (index-of-crlf buf pos)]
+    [(ba->latin1 (sub-ba buf pos crlf)) buf (+ crlf 2)]))
+
+(defn- drain-trailers!
+  "Consume a chunked message's trailer section — header lines up to a blank one
+  — after the terminal chunk. It is not optional once the connection is reused:
+  anything left of this message arrives in front of the NEXT response on it.
+  Failing here means the peer went away rather than sending the trailers, which
+  costs nothing — the body is already complete, and a pooled socket the peer has
+  closed is detected before it is handed out again."
+  [stream buf pos deadline]
+  (try (loop [buf buf pos pos]
+         (let [[l buf pos] (crlf-line stream buf pos deadline)]
+           (when-not (= "" l) (recur buf pos))))
+       (catch Throwable _ nil))
+  nil)
+
 (defn- read-sized
   "Exactly `len` body bytes, given `pending` (what was read past the headers)."
   [stream pending len deadline]
@@ -566,7 +593,8 @@
         (nil? size) (throw-typed "java.io.IOException"
                                  (str "malformed chunk size: " (pr-str line)))
         (neg? size) (throw-typed "java.io.IOException" (str "negative chunk size: " size))
-        (zero? size) (concat-bas out)              ;; terminal chunk; trailers are not read
+        (zero? size) (do (drain-trailers! stream buf (+ crlf 2) deadline)
+                         (concat-bas out))
         :else
         (let [data-start (+ crlf 2)
               n (alength buf)
@@ -631,21 +659,13 @@
               (do (reset! done true) nil)))))))
 
 (defn- chunked-pull
-  "Pulls a chunked body one chunk at a time. Mirrors read-chunked's framing —
-  including that the terminal chunk ends the body and trailers are not read."
+  "Pulls a chunked body one chunk at a time."
   [stream pending deadline]
   (let [state (atom {:buf pending :pos 0 :done false})]
     (fn []
       (let [{start-buf :buf start-pos :pos done :done} @state]
         (when-not done
-          (let [[buf pos] (loop [buf start-buf pos start-pos]
-                            (if (index-of-crlf buf pos)
-                              [buf pos]
-                              (if-let [b (read-more! stream deadline)]
-                                (recur (concat-bas [(sub-ba buf pos (alength buf)) b]) 0)
-                                (throw-typed "java.io.IOException" "connection closed mid-chunk"))))
-                crlf (index-of-crlf buf pos)
-                line (ba->latin1 (sub-ba buf pos crlf))
+          (let [[line buf pos] (crlf-line stream start-buf start-pos deadline)
                 semi (str/index-of line ";")
                 size (try (Long/parseLong (str/trim (if semi (subs line 0 semi) line)) 16)
                           (catch Throwable _ nil))]
@@ -653,9 +673,10 @@
               (nil? size) (throw-typed "java.io.IOException"
                                        (str "malformed chunk size: " (pr-str line)))
               (neg? size) (throw-typed "java.io.IOException" (str "negative chunk size: " size))
-              (zero? size) (do (swap! state assoc :done true) nil)
+              (zero? size) (do (swap! state assoc :done true)
+                               (drain-trailers! stream buf pos deadline))
               :else
-              (let [data-start (+ crlf 2)
+              (let [data-start pos
                     n (alength buf)
                     have (max 0 (- n data-start))
                     copied (min size have)
@@ -664,7 +685,7 @@
                     overflow (if (< copied size)
                                (fill-into! stream piece copied (- size copied) deadline)
                                (sub-ba buf (+ data-start size) n))
-                    ;; the CRLF that closes the chunk
+                    ;; the CRLF that closes the chunk data
                     [buf pos] (ensure-bytes stream overflow 0 2 deadline)]
                 (reset! state {:buf buf :pos (+ pos 2) :done false})
                 piece))))))))

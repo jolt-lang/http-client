@@ -117,14 +117,22 @@
       (= uri "/stream-ticks")
       (let [conn (:conn req)
             send (fn [s] (srv/conn-write conn (core/latin1->ba s)))]
+        ;; Connection: close, because this route holds the socket open after the
+        ;; body and serves exactly one request: a client that pooled it would
+        ;; send its next request into a connection nobody is reading.
         (send (str "HTTP/1.1 200 OK\r\n"
                    "Content-Type: text/event-stream\r\n"
-                   "Transfer-Encoding: chunked\r\n\r\n"))
+                   "Transfer-Encoding: chunked\r\n"
+                   "Connection: close\r\n\r\n"))
         (dotimes [i tick-count]
           (let [payload (str "tick " i "\n")]
             (send (str (Integer/toHexString (count payload)) "\r\n" payload "\r\n")))
           (Thread/sleep tick-ms))
-        (send "0\r\n\r\n")
+        ;; A terminal chunk, a trailer section, and then the socket held open: a
+        ;; client that takes the close for the end of the body waits the hold out
+        ;; instead of finishing at the terminal chunk.
+        (send "0\r\nX-Tick-Count: 8\r\n\r\n")
+        (Thread/sleep 1500)
         (srv/conn-close conn)
         :hijacked)
 
