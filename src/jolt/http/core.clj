@@ -604,6 +604,43 @@
   (contains? #{"class java.io.EOFException" "class java.net.SocketException"}
              (str (class t))))
 
+(defn- read-head!
+  "Read and parse the response head off `stream`, reading no further than the
+  blank line that ends it. Returns {:status :version :header-pairs :pending},
+  where :pending is whatever of the body arrived in the same reads."
+  [stream deadline read-more!]
+  ;; read until the blank line, rescanning only the tail
+  (let [[buf end] (loop [buf (byte-array 0) scanned 0]
+                    (let [s (ba->latin1 buf)]
+                      (if-let [i (str/index-of s "\r\n\r\n" (max 0 (- scanned 3)))]
+                        [buf i]
+                        (if-let [b (read-more! stream deadline)]
+                          (recur (concat-bas [buf b]) (alength buf))
+                          ;; Nothing at all arrived: the peer hung up without
+                          ;; answering, which on a REUSED connection means it
+                          ;; had already retired the socket and never saw the
+                          ;; request. Distinguished from a truncated response
+                          ;; so the pool can retry that case and only that one.
+                          (if (zero? (alength buf))
+                            (throw-typed "java.io.EOFException"
+                                         "connection closed before any response was received")
+                            (throw-typed "java.io.IOException"
+                                         "malformed response: no header terminator"))))))]
+    (assoc (parse-head (ba->latin1 (sub-ba buf 0 end)))
+           :pending (sub-ba buf (+ end 4) (alength buf)))))
+
+(defn- keep-alive?
+  "Whether the connection may be reused after this response. Only a response
+  that said exactly how long it was can be — read-to-close framing IS the close
+  — and only when the peer did not ask to close it. HTTP/1.0 is the other way
+  round: not persistent unless it says so, so a 1.0 response is kept only on an
+  explicit keep-alive."
+  [version conn-hdr framed?]
+  (boolean (and framed?
+                (not (str/includes? conn-hdr "close"))
+                (or (not= "HTTP/1.0" version)
+                    (str/includes? conn-hdr "keep-alive")))))
+
 (defn read-response
   "Read one HTTP/1.1 response off `stream`, framed the way the response says it
   is framed. `deadline` is an absolute System/currentTimeMillis bound on the
@@ -621,25 +658,7 @@
                       (let [b (read-more! stream deadline)]
                         (when (and b received) (reset! received true))
                         b))
-         ;; headers first: read until the blank line, rescanning only the tail
-         [buf end] (loop [buf (byte-array 0) scanned 0]
-                     (let [s (ba->latin1 buf)]
-                       (if-let [i (str/index-of s "\r\n\r\n" (max 0 (- scanned 3)))]
-                         [buf i]
-                         (if-let [b (read-more! stream deadline)]
-                           (recur (concat-bas [buf b]) (alength buf))
-                           ;; Nothing at all arrived: the peer hung up without
-                           ;; answering, which on a REUSED connection means it
-                           ;; had already retired the socket and never saw the
-                           ;; request. Distinguished from a truncated response
-                           ;; so the pool can retry that case and only that one.
-                           (if (zero? (alength buf))
-                             (throw-typed "java.io.EOFException"
-                                          "connection closed before any response was received")
-                             (throw-typed "java.io.IOException"
-                                          "malformed response: no header terminator")))))) 
-         {:keys [status version header-pairs]} (parse-head (ba->latin1 (sub-ba buf 0 end)))
-         pending (sub-ba buf (+ end 4) (alength buf))
+         {:keys [status version header-pairs pending]} (read-head! stream deadline read-more!)
          te (header-ci header-pairs "transfer-encoding")
          chunked? (and te (str/includes? (str/lower-case te) "chunked"))
          len (when-not chunked?
@@ -657,14 +676,217 @@
      {:status status
       :header-pairs header-pairs
       :body body
-      ;; A connection can only be kept when the response said exactly how long
-      ;; it was — read-to-close framing IS the close — and the peer did not ask
-      ;; to close it. HTTP/1.0 is the other way round: not persistent unless it
-      ;; says so, so a 1.0 response is kept only on an explicit keep-alive.
-      :reusable? (boolean (and (or chunked? (and len (>= len 0)) (bodyless? method status))
-                               (not (str/includes? conn-hdr "close"))
-                               (or (not= "HTTP/1.0" version)
-                                   (str/includes? conn-hdr "keep-alive"))))})))
+      :reusable? (keep-alive? version conn-hdr
+                              (or chunked? (and len (>= len 0)) (bodyless? method status)))})))
+
+;; --- streaming response bodies ---------------------------------------------
+;; `:as :stream` (BodyHandlers/ofInputStream) hands the caller a LIVE
+;; java.io.InputStream: read-response-stream returns as soon as the headers are
+;; in, and body bytes come off the wire as the caller reads them. Every other
+;; handler keeps the read-to-completion path above, where the body is a
+;; byte-array by the time the response value exists — which is what lets the
+;; connection go straight back to the pool.
+;;
+;; A live stream cannot do that: the socket is still mid-body, so the stream
+;; owns the connection until it is closed. `on-close` is handed whether the
+;; connection is still fit to reuse — the body ran to its framed end AND the
+;; response said the connection may be kept — and settles it.
+;;
+;; The per-request deadline bounds the HEAD only. A body still arriving is not a
+;; stalled one, and checking a whole-response deadline on every read is exactly
+;; what made an endless body (an SSE stream) fail at :timeout instead of
+;; delivering. The per-read socket timeout (:socket-timeout, set-stream-timeout!)
+;; is what still catches a peer that has actually gone quiet.
+
+(defn- next-block-sized
+  "Successive blocks of a Content-Length body, nil once `len` bytes are in."
+  [stream pending len]
+  (let [buf (atom pending) left (atom len)]
+    (fn []
+      (loop []
+        (cond
+          (not (pos? @left)) nil
+          (zero? (alength @buf))
+            (if-let [b (s-read stream nil)]
+              (do (reset! buf b) (recur))
+              (throw-typed "java.io.IOException" "connection closed mid-body"))
+          :else
+            (let [b @buf n (min (alength b) @left)]
+              (reset! buf (sub-ba b n (alength b)))
+              (swap! left - n)
+              (sub-ba b 0 n)))))))
+
+(defn- next-block-chunked
+  "Successive blocks of a chunked body, nil at the terminal chunk. Unlike
+  read-chunked this consumes the trailer section too: the connection may be
+  reused after a streamed body, so nothing of the message may be left on it."
+  [stream pending]
+  (let [buf (atom pending) left (atom 0) done (atom false)
+        fill! (fn []
+                (if-let [b (s-read stream nil)]
+                  (do (swap! buf (fn [cur] (concat-bas [cur b]))) true)
+                  false))
+        line! (fn []
+                (loop []
+                  (if-let [i (index-of-crlf @buf 0)]
+                    (let [l (ba->latin1 (sub-ba @buf 0 i))]
+                      (swap! buf (fn [cur] (sub-ba cur (+ i 2) (alength cur))))
+                      l)
+                    (if (fill!)
+                      (recur)
+                      (throw-typed "java.io.IOException" "connection closed mid-chunk")))))]
+    (fn []
+      (loop []
+        (cond
+          @done nil
+          (pos? @left)
+            (do (when (zero? (alength @buf))
+                  (when-not (fill!)
+                    (throw-typed "java.io.IOException" "connection closed mid-chunk")))
+                (let [b @buf n (min (alength b) @left)]
+                  (reset! buf (sub-ba b n (alength b)))
+                  (swap! left - n)
+                  (when-not (pos? @left) (line!))   ;; the CRLF closing the chunk data
+                  (sub-ba b 0 n)))
+          :else
+            (let [l (line!)
+                  semi (str/index-of l ";")
+                  size (try (Long/parseLong (str/trim (if semi (subs l 0 semi) l)) 16)
+                            (catch Throwable _ nil))]
+              (cond
+                ;; A size we cannot read means the rest of the body is
+                ;; unrecoverable; ending the stream here would truncate it
+                ;; silently, which is what the eager path refuses too.
+                (nil? size) (throw-typed "java.io.IOException"
+                                         (str "malformed chunk size: " (pr-str l)))
+                (neg? size) (throw-typed "java.io.IOException"
+                                         (str "negative chunk size: " size))
+                (zero? size) (do (reset! done true)
+                                 (loop [] (when-not (= "" (line!)) (recur)))
+                                 nil)
+                :else (do (reset! left size) (recur)))))))))
+
+(defn- next-block-until-close
+  "Successive blocks of an unframed body, nil when the peer closes — which for
+  this framing IS the end of the message."
+  [stream pending]
+  (let [buf (atom pending) done (atom false)]
+    (fn []
+      (loop []
+        (cond
+          @done nil
+          (pos? (alength @buf)) (let [b @buf] (reset! buf (byte-array 0)) b)
+          :else (if-let [b (s-read stream nil)]
+                  (do (reset! buf b) (recur))
+                  (do (reset! done true) nil)))))))
+
+(defn make-body-stream
+  "A java.io.InputStream served by `next-block!`, a 0-arg fn handing back the
+  next byte-array of body or nil at the end of it.
+
+  `on-close` runs exactly once — when the body ends or the caller closes,
+  whichever is first — and is passed whether the connection may still be
+  reused: true only if the body reached its framed end."
+  [next-block! reusable? on-close]
+  (let [buf (atom (byte-array 0))
+        ended (atom false)
+        closed (atom false)
+        close! (fn []
+                 (when-not @closed
+                   (reset! closed true)
+                   (on-close (boolean (and @ended reusable?)))))
+        ;; the buffered block, refilled as needed; nil at the end of the body
+        ready! (fn []
+                 (loop []
+                   (cond
+                     (pos? (alength @buf)) @buf
+                     @ended nil
+                     :else (if-let [b (next-block!)]
+                             (do (reset! buf b) (recur))
+                             (do (reset! ended true) (close!) nil)))))
+        ;; mark/reset: the bytes consumed since the mark, kept so reset can put
+        ;; them back, or nil when there is no live mark. java.io.BufferedInputStream
+        ;; is the identity over a stream it cannot seek on this host, so a caller
+        ;; that wraps this to mark/reset — babashka.http-client's `inflate` does,
+        ;; to tell zlib deflate from raw — lands on these directly.
+        mark-buf (atom nil)
+        mark-limit (atom 0)
+        take! (fn [src n]
+                (when-let [m @mark-buf]
+                  (let [m' (concat-bas [m (sub-ba src 0 n)])]
+                    ;; past the readlimit the mark is allowed to lapse, and a
+                    ;; later reset is then an error rather than a wrong rewind
+                    (reset! mark-buf (when (<= (alength m') @mark-limit) m'))))
+                (reset! buf (sub-ba src n (alength src))))
+        read-into! (fn [b off len]
+                     (if-not (pos? len)
+                       0
+                       (if-let [src (ready!)]
+                         (let [n (min len (alength src))]
+                           (copy-into! src 0 b off n)
+                           (take! src n)
+                           n)
+                         -1)))]
+    (proxy [java.io.InputStream] []
+      ;; the proxy fn stands in for every overload of the name, so all three
+      ;; of InputStream's reads are answered here
+      (read
+        ([] (if-let [src (ready!)]
+              (let [v (bit-and (aget src 0) 0xff)] (take! src 1) v)
+              -1))
+        ([b] (read-into! b 0 (alength b)))
+        ([b off len] (read-into! b off len)))
+      ;; what can be had without blocking: the block already in hand
+      (available [] (alength @buf))
+      (markSupported [] true)
+      (mark [limit] (reset! mark-limit limit) (reset! mark-buf (byte-array 0)) nil)
+      (reset []
+        (if-let [m @mark-buf]
+          (do (reset! buf (concat-bas [m @buf]))
+              ;; the mark survives a reset, as it does on the JVM
+              (reset! mark-buf (byte-array 0))
+              nil)
+          (throw-typed "java.io.IOException" "resetting to invalid mark")))
+      (close [] (close!) nil))))
+
+(defn read-response-stream
+  "Read one HTTP/1.1 response head off `stream` and hand back a response whose
+  :body is a LIVE java.io.InputStream over the rest (see the note above).
+  Returns as soon as the headers are in.
+
+  `on-close` is called once, with whether the connection may be reused, when
+  the body ends or the stream is closed."
+  [stream deadline method received on-close]
+  (let [deadline (effective-deadline deadline)
+        read-more! (fn [stream deadline]
+                     (let [b (read-more! stream deadline)]
+                       (when (and b received) (reset! received true))
+                       b))
+        {:keys [status version header-pairs pending]} (read-head! stream deadline read-more!)
+        te (header-ci header-pairs "transfer-encoding")
+        chunked? (and te (str/includes? (str/lower-case te) "chunked"))
+        len (when-not chunked?
+              (parse-long (str/trim (or (header-ci header-pairs "content-length") ""))))
+        conn-hdr (str/lower-case (str (header-ci header-pairs "connection")))
+        bodyless? (bodyless? method status)
+        reusable? (keep-alive? version conn-hdr
+                               (or chunked? (and len (>= len 0)) bodyless?))
+        body (cond
+               ;; nothing to stream: settle the connection now, exactly as the
+               ;; eager path would, and hand back an empty stream
+               bodyless?
+                 (do (on-close reusable?) (make-bais (byte-array 0)))
+               chunked?
+                 (make-body-stream (next-block-chunked stream pending) reusable? on-close)
+               (and len (>= len 0))
+                 (make-body-stream (next-block-sized stream pending len) reusable? on-close)
+               ;; no framing at all: the peer's close is the delimiter
+               :else
+                 (make-body-stream (next-block-until-close stream pending) reusable? on-close))]
+    {:status status
+     :header-pairs header-pairs
+     :body body
+     :reusable? reusable?}))
 
 (defn build-request
   "Serialise one HTTP/1.1 request. `absolute-target`, when given, replaces the

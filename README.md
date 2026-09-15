@@ -74,11 +74,16 @@ send runs on jolt's own future pool. Each is recorded on the client and read
 back, so a caller that sets and inspects one sees what it set. WebSocket
 negotiates no extensions, so no `permessage-deflate`.
 
-Response bodies are read in full before the response is returned, so `:as
-:stream` hands back a stream over the complete body rather than a live one. It
-behaves like the JDK's for anything finite — `slurp`, `io/copy` and `io/reader`
-all work on it — but a response that never ends, such as an SSE feed, never
-returns. Restricted request headers behave as `java.net.http` does: setting
+`:as :stream` (`BodyHandlers/ofInputStream`) hands back a **live** stream: the
+call returns once the response headers are in, and the body comes off the wire
+as you read it, so an SSE feed or a log tail streams rather than hanging. The
+stream owns the connection until it is closed or the body ends, and supports
+`mark`/`reset`. Every other body handler still reads the body in full before
+the response is returned. Note that a per-request `:timeout` bounds the
+**headers** for a streamed body — a body still arriving is not a stalled one —
+while `:socket-timeout` still bounds each individual read.
+
+Restricted request headers behave as `java.net.http` does: setting
 `content-length`, `connection`, `host`, `upgrade` or `expect` on a request is an
 `IllegalArgumentException`, because the client owns them.
 

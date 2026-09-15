@@ -516,19 +516,34 @@
   "One request/response over `stream`. Releases the connection back to the pool
   when the response says it may be kept, and closes it otherwise — including on
   the way out of a failure, where the state of the connection is unknown.
-  `received` is set as soon as any response byte arrives."
-  [stream absolute? key {:keys [url method headers body deadline]} received]
-  (let [ok (atom false)]
-    (try
-      (core/s-write stream (core/build-request method url headers body
-                                               (when absolute? (core/spec-no-ref url))))
-      (let [resp (core/read-response stream deadline method received)]
-        (reset! ok (:reusable? resp))
-        resp)
-      (finally
-        (if @ok
-          (core/pool-release! key stream)
-          (try (core/s-close stream) (catch Throwable _ nil)))))))
+  `received` is set as soon as any response byte arrives.
+
+  A `:stream?` request returns once the head is in, with a live body: the
+  connection is then still mid-message, so it is the STREAM that settles it —
+  released on close if the body ran to its framed end, closed otherwise. Until
+  the head completes there is no stream to own it, so a failure there still
+  closes the connection here."
+  [stream absolute? key {:keys [url method headers body deadline stream?]} received]
+  (let [settle! (fn [reuse?]
+                  (if reuse?
+                    (core/pool-release! key stream)
+                    (try (core/s-close stream) (catch Throwable _ nil))))
+        send! #(core/s-write stream (core/build-request method url headers body
+                                                        (when absolute? (core/spec-no-ref url))))]
+    (if stream?
+      (try
+        (send!)
+        (core/read-response-stream stream deadline method received settle!)
+        (catch Throwable t
+          (settle! false)
+          (throw t)))
+      (let [ok (atom false)]
+        (try
+          (send!)
+          (let [resp (core/read-response stream deadline method received)]
+            (reset! ok (:reusable? resp))
+            resp)
+          (finally (settle! @ok)))))))
 
 (defn- exchange
   "One request/response, over a pooled connection when one is available.
@@ -593,6 +608,9 @@
         selector (tget client :proxy)
         policy (or (tget client :follow-redirects) :jolt.http.redirect/NEVER)
         deadline (when req-timeout (+ (System/currentTimeMillis) req-timeout))
+        ;; ofInputStream is the one handler whose body is not read here: the
+        ;; caller gets it live, off the wire, as it arrives (core/make-body-stream)
+        stream? (= handler :jolt.http/handler-inputstream)
         start-uri (tget request :uri)]
     (loop [uri start-uri
            url (core/parse-url (str start-uri))
@@ -609,19 +627,26 @@
             hdrs (request-headers (or (tget request :headers) []) uri cookie-handler auth-header)
             resp (exchange {:url url :method method :headers hdrs :body body
                             :read-timeout req-timeout :conn-timeout conn-timeout
-                            :insecure? insecure? :proxy prx :ssl ssl :deadline deadline})
+                            :insecure? insecure? :proxy prx :ssl ssl :deadline deadline
+                            :stream? stream?})
             pairs (:header-pairs resp)]
         (when cookie-handler
           (cookie-manager-put! cookie-handler uri (headers->map pairs)))
         (let [loc (header-value pairs "location")
               status (:status resp)
               auth-retry (when (and (= 401 status) (not retried-auth?))
-                           (authenticator-header (tget client :authenticator)))]
+                           (authenticator-header (tget client :authenticator)))
+              ;; a hop we are not handing back (a redirect, a 401 we retry) owns
+              ;; a live body nobody will read; closing it is what settles its
+              ;; connection, and an unread body means it cannot be pooled
+              drop-body! (fn [] (when stream?
+                                  (try (.close (:body resp)) (catch Throwable _ nil))))]
           (cond
             ;; 401 with an authenticator configured: retry the same request once
             ;; with credentials, which is what java.net.http's Authenticator does.
             (and (= 401 status) (not retried-auth?) auth-retry)
-              (recur uri url method body auth-retry redirects true)
+              (do (drop-body!)
+                  (recur uri url method body auth-retry redirects true))
 
             (and loc (core/redirect-statuses status) (< redirects 20)
                  (let [to (core/resolve-location url loc)] (follow? policy url to)))
@@ -630,6 +655,7 @@
                     ;; to GET and drops the body.
                     to-get? (or (= 303 status)
                                 (and (#{301 302} status) (not (#{"GET" "HEAD"} method))))]
+                (drop-body!)
                 (recur (java.net.URI/create (tget to :spec)) to
                        (if to-get? "GET" method)
                        (if to-get? nil body)
@@ -638,8 +664,10 @@
             :else
             (let [body-bytes (:body resp)
                   out-body (cond
+                             ;; ofInputStream: already the live stream
+                             ;; read-response-stream built, not bytes to wrap
+                             stream? body-bytes
                              (= handler :jolt.http/handler-string) (String. ^bytes body-bytes "UTF-8")
-                             (= handler :jolt.http/handler-inputstream) (core/make-bais body-bytes)
                              (= handler :jolt.http/handler-discarding) nil
                              :else body-bytes)]
               (doto (tt :jolt.http/response)
