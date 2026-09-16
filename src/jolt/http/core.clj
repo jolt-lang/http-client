@@ -532,6 +532,33 @@
                 (sub-ba b remaining n))))
         (throw-typed "java.io.IOException" "connection closed mid-body")))))
 
+(defn- crlf-line
+  "The next CRLF-terminated line at `pos`, reading as needed. Returns
+  [line buf pos-after-the-CRLF]."
+  [stream buf pos deadline]
+  (let [[buf pos] (loop [buf buf pos pos]
+                    (if (index-of-crlf buf pos)
+                      [buf pos]
+                      (if-let [b (read-more! stream deadline)]
+                        (recur (concat-bas [(sub-ba buf pos (alength buf)) b]) 0)
+                        (throw-typed "java.io.IOException" "connection closed mid-chunk"))))
+        crlf (index-of-crlf buf pos)]
+    [(ba->latin1 (sub-ba buf pos crlf)) buf (+ crlf 2)]))
+
+(defn- drain-trailers!
+  "Consume a chunked message's trailer section — header lines up to a blank one
+  — after the terminal chunk. It is not optional once the connection is reused:
+  anything left of this message arrives in front of the NEXT response on it.
+  Failing here means the peer went away rather than sending the trailers, which
+  costs nothing — the body is already complete, and a pooled socket the peer has
+  closed is detected before it is handed out again."
+  [stream buf pos deadline]
+  (try (loop [buf buf pos pos]
+         (let [[l buf pos] (crlf-line stream buf pos deadline)]
+           (when-not (= "" l) (recur buf pos))))
+       (catch Throwable _ nil))
+  nil)
+
 (defn- read-sized
   "Exactly `len` body bytes, given `pending` (what was read past the headers)."
   [stream pending len deadline]
@@ -566,7 +593,8 @@
         (nil? size) (throw-typed "java.io.IOException"
                                  (str "malformed chunk size: " (pr-str line)))
         (neg? size) (throw-typed "java.io.IOException" (str "negative chunk size: " size))
-        (zero? size) (concat-bas out)              ;; terminal chunk; trailers are not read
+        (zero? size) (do (drain-trailers! stream buf (+ crlf 2) deadline)
+                         (concat-bas out))
         :else
         (let [data-start (+ crlf 2)
               n (alength buf)
@@ -582,6 +610,199 @@
               ;; the CRLF that closes the chunk
               [buf pos] (ensure-bytes stream overflow 0 2 deadline)]
           (recur buf (+ pos 2) (conj out piece)))))))
+
+;; --- streaming bodies -------------------------------------------------------
+;; `:as :stream` (BodyHandlers/ofInputStream) used to hand back a
+;; ByteArrayInputStream over a body that had already been read to EOF, so the
+;; CALL did not return until the response ended: a live SSE stream — an LLM token
+;; feed, an MCP text/event-stream, a log tailer — either blocked forever or died
+;; at :timeout, and every such client had to shell out to curl instead
+;; (jolt-lang/jolt#1007).
+;;
+;; The readers below pull one framed piece of the body off the wire per call, so
+;; the response can be handed back the moment the headers are in. Framing is the
+;; response's own — the same Content-Length / chunked / read-to-close reading the
+;; buffered path does — so the stream ends where the BODY ends and not where the
+;; connection does.
+;;
+;; `deadline` here is NOT the request timeout. java.net.http's HttpRequest.timeout
+;; bounds the time to the RESPONSE, and does not cut a body already in flight; a
+;; total deadline over the body is what made a stream that outlived :timeout fail
+;; mid-flight on jolt and succeed on the JVM (jolt-lang/jolt#1017). What bounds a
+;; streamed body is the socket's own read timeout — inactivity, which is what an
+;; SSE reader wants — plus set-max-response-ms!, which an app asks for by name.
+
+(defn- sized-pull
+  "Pulls a Content-Length body, `len` bytes, in the pieces it arrives in."
+  [stream pending len deadline]
+  (let [buf (atom pending) left (atom len)]
+    (fn []
+      (when (pos? @left)
+        (let [b (if (pos? (alength @buf))
+                  @buf
+                  (or (read-more! stream deadline)
+                      (throw-typed "java.io.IOException" "connection closed mid-body")))
+              n (min @left (alength b))]
+          (reset! buf (sub-ba b n (alength b)))
+          (swap! left - n)
+          (sub-ba b 0 n))))))
+
+(defn- to-close-pull
+  "Pulls a body with no framing at all: the peer's close is the delimiter."
+  [stream pending deadline]
+  (let [buf (atom pending) done (atom false)]
+    (fn []
+      (when-not @done
+        (if (pos? (alength @buf))
+          (let [b @buf] (reset! buf (byte-array 0)) b)
+          (or (read-more! stream deadline)
+              (do (reset! done true) nil)))))))
+
+(defn- chunked-pull
+  "Pulls a chunked body one chunk at a time."
+  [stream pending deadline]
+  (let [state (atom {:buf pending :pos 0 :done false})]
+    (fn []
+      (let [{start-buf :buf start-pos :pos done :done} @state]
+        (when-not done
+          (let [[line buf pos] (crlf-line stream start-buf start-pos deadline)
+                semi (str/index-of line ";")
+                size (try (Long/parseLong (str/trim (if semi (subs line 0 semi) line)) 16)
+                          (catch Throwable _ nil))]
+            (cond
+              (nil? size) (throw-typed "java.io.IOException"
+                                       (str "malformed chunk size: " (pr-str line)))
+              (neg? size) (throw-typed "java.io.IOException" (str "negative chunk size: " size))
+              (zero? size) (do (swap! state assoc :done true)
+                               (drain-trailers! stream buf pos deadline))
+              :else
+              (let [data-start pos
+                    n (alength buf)
+                    have (max 0 (- n data-start))
+                    copied (min size have)
+                    piece (byte-array size)
+                    _ (copy-into! buf data-start piece 0 copied)
+                    overflow (if (< copied size)
+                               (fill-into! stream piece copied (- size copied) deadline)
+                               (sub-ba buf (+ data-start size) n))
+                    ;; the CRLF that closes the chunk data
+                    [buf pos] (ensure-bytes stream overflow 0 2 deadline)]
+                (reset! state {:buf buf :pos (+ pos 2) :done false})
+                piece))))))))
+
+;; A reify over java.io.InputStream rather than a tagged table, and that choice
+;; is the whole point: jolt drives a reify InputStream through its own
+;; read(byte[],int,int) — io/reader decodes it through a pull port, slurp and
+;; io/copy read it block by block — whereas a :jolt/input-stream tagged table is
+;; DRAINED to a string at every coercion site, which is exactly the blocking this
+;; replaces. Probed rather than assumed, the way host-byte-streams? is: on a host
+;; that cannot answer one, make-body-stream's caller keeps the buffered path.
+(def reify-input-streams?
+  (try (let [s (reify java.io.InputStream (read [_ _buf _off _len] -1))]
+         (and (instance? java.io.InputStream s)
+              (zero? (alength (.readAllBytes s)))))
+       (catch Throwable _ false)))
+
+(defn make-body-stream
+  "A java.io.InputStream over a body still arriving on the wire.
+
+  `pull` yields the next byte-array of the body, or nil at its end. `release!`
+  is called exactly once with true when the body was read to its end — the
+  connection can go back to the pool — and with false when the caller closed
+  early or a read failed, where what is left on the socket is unknown and the
+  connection must be closed."
+  [pull release!]
+  (let [queue (atom [])        ;; byte-arrays to serve before pulling any more
+        buf (atom (byte-array 0))
+        pos (atom 0)
+        ;; what has been handed out since .mark, so .reset can replay it; nil
+        ;; when there is no live mark
+        marked (atom nil)
+        ended (atom false)         ;; the body reached its end
+        closed (atom false)        ;; the caller called .close
+        released (atom false)
+        release! (fn [complete?]
+                   (when (compare-and-set! released false true)
+                     (try (release! complete?) (catch Throwable _ nil))))
+        ;; true when at least one byte is ready; false at the end of the body.
+        ;; A pull that fails takes the connection with it: whatever is still on
+        ;; the socket belongs to a response nobody can frame any more.
+        fill! (fn []
+                (loop []
+                  (cond
+                    (< @pos (alength @buf)) true
+                    (seq @queue) (let [q @queue]
+                                   (reset! buf (nth q 0))
+                                   (reset! queue (subvec q 1))
+                                   (reset! pos 0)
+                                   (recur))
+                    (or @ended @closed) false
+                    :else (if-let [b (try (pull)
+                                          (catch Throwable t (release! false) (throw t)))]
+                            (do (reset! buf b) (reset! pos 0) (recur))
+                            (do (reset! ended true) (release! true) false)))))
+        take! (fn [n]
+                ;; n bytes from the current buffer, recorded when marked
+                (let [b @buf p @pos]
+                  (when @marked (swap! marked conj (sub-ba b p (+ p n))))
+                  (reset! pos (+ p n))
+                  [b p]))]
+    (reify java.io.InputStream
+      ;; -1 at end of stream, an UNSIGNED byte otherwise: a caller cannot tell
+      ;; 0xff from the end any other way, and byte-array elements are signed.
+      (read [_]
+        (if (fill!)
+          (let [[b p] (take! 1)] (bit-and (aget b p) 0xff))
+          -1))
+      (read [this dst] (.read this dst 0 (alength dst)))
+      ;; Fills what is ready and returns that count — a stream read is not
+      ;; obliged to fill the array, and blocking for more is what a caller
+      ;; reading a live stream is trying to avoid.
+      (read [_ dst off len]
+        (cond
+          (zero? len) 0
+          (not (fill!)) -1
+          :else (let [n (min len (- (alength @buf) @pos))
+                      [b p] (take! n)]
+                  (copy-into! b p dst off n)
+                  n)))
+      (available [_] (reduce (fn [n b] (+ n (alength b)))
+                             (max 0 (- (alength @buf) @pos))
+                             @queue))
+      ;; mark/reset over a live stream, by replaying what was read since the
+      ;; mark. java.io.BufferedInputStream is the JVM's mark/reset provider and
+      ;; wrapping ANY stream in one makes markSupported true there — but jolt's
+      ;; BufferedInputStream has no replay layer, so over a stream that cannot
+      ;; seek it is a pass-through with markSupported false. Which means the
+      ;; mark has to live here or nowhere, and it is not optional:
+      ;; babashka.http-client's deflate detection marks, reads, and resets
+      ;; (interceptors/inflate), so without it every `Content-Encoding: deflate`
+      ;; response fails.
+      ;;
+      ;; `readlimit` is not honoured, deliberately. The JVM treats it as the
+      ;; point past which a mark MAY be dropped and BufferedInputStream keeps
+      ;; more than asked; here the reader that resets is one whose first act is
+      ;; to drain — our InflaterInputStream decompresses whole payloads up front
+      ;; — so dropping the mark at babashka's 512 would break every deflate
+      ;; response longer than that. The cost is that a marked stream buffers
+      ;; what is read until the mark is dropped, which .reset does.
+      (markSupported [_] true)
+      (mark [_ _readlimit] (reset! marked []) nil)
+      (reset [_]
+        (when (nil? @marked)
+          (throw-typed "java.io.IOException" "Resetting to invalid mark"))
+        (let [replay (conj @marked (sub-ba @buf @pos (alength @buf)))]
+          (reset! queue (vec (remove (fn [b] (zero? (alength b)))
+                                     (concat replay @queue))))
+          (reset! buf (byte-array 0))
+          (reset! pos 0)
+          ;; the mark survives a reset, as it does on the JVM
+          (reset! marked []))
+        nil)
+      (close [_]
+        (reset! closed true)
+        (release! false)
+        nil))))
 
 (defn- bodyless?
   "Responses that carry no body however they are framed (RFC 7230 3.3): a HEAD
@@ -607,15 +828,25 @@
 (defn read-response
   "Read one HTTP/1.1 response off `stream`, framed the way the response says it
   is framed. `deadline` is an absolute System/currentTimeMillis bound on the
-  whole read; `method` decides whether a body is expected at all.
+  read; `method` decides whether a body is expected at all.
 
   `received`, when given, is an atom set to true the moment the first response
   byte arrives. It is what tells a caller holding a reused connection whether a
-  failure means the peer never answered."
-  ([stream] (read-response stream nil "GET" nil))
-  ([stream deadline] (read-response stream deadline "GET" nil))
-  ([stream deadline method] (read-response stream deadline method nil))
-  ([stream deadline method received]
+  failure means the peer never answered.
+
+  `stream-body?` asks for the body to be left on the wire: the map then carries
+  `:body-pull`, a 0-arg fn yielding the next byte-array of the body and nil at
+  its end, and `:body` is nil. The caller owns the connection until that pull is
+  exhausted — nothing here closes or pools it — and `deadline` bounds only the
+  read up to the end of the headers, because a total bound over a body still
+  arriving is the divergence jolt-lang/jolt#1017 is about. A body that cannot
+  stream (a HEAD/204/304, or a Content-Length of 0) comes back buffered, as it
+  always did."
+  ([stream] (read-response stream nil "GET" nil false))
+  ([stream deadline] (read-response stream deadline "GET" nil false))
+  ([stream deadline method] (read-response stream deadline method nil false))
+  ([stream deadline method received] (read-response stream deadline method received false))
+  ([stream deadline method received stream-body?]
    (let [deadline (effective-deadline deadline)
          read-more! (fn [stream deadline]
                       (let [b (read-more! stream deadline)]
@@ -644,19 +875,36 @@
          chunked? (and te (str/includes? (str/lower-case te) "chunked"))
          len (when-not chunked?
                (parse-long (str/trim (or (header-ci header-pairs "content-length") ""))))
-         body (cond
-                (bodyless? method status) (byte-array 0)
-                chunked? (read-chunked stream pending deadline)
-                (and len (>= len 0)) (read-sized stream pending len deadline)
-                ;; no framing at all: the peer's close is the delimiter
-                :else (concat-bas (loop [chunks [pending]]
-                                    (if-let [b (read-more! stream deadline)]
-                                      (recur (conj chunks b))
-                                      chunks))))
+         ;; An empty body is not worth a stream, and a bodyless response has
+         ;; nothing to stream: both keep the buffered path, so a caller always
+         ;; gets either :body or :body-pull and never neither.
+         stream? (boolean (and stream-body?
+                               reify-input-streams?
+                               (not (bodyless? method status))
+                               (not (and len (zero? len)))))
+         ;; Not `deadline`: see the docstring. set-max-response-ms! still
+         ;; applies — an app that asks for a total cap by name gets one.
+         body-deadline (when stream? (effective-deadline nil))
+         body-pull (when stream?
+                     (cond
+                       chunked? (chunked-pull stream pending body-deadline)
+                       (and len (pos? len)) (sized-pull stream pending len body-deadline)
+                       :else (to-close-pull stream pending body-deadline)))
+         body (when-not stream?
+                (cond
+                  (bodyless? method status) (byte-array 0)
+                  chunked? (read-chunked stream pending deadline)
+                  (and len (>= len 0)) (read-sized stream pending len deadline)
+                  ;; no framing at all: the peer's close is the delimiter
+                  :else (concat-bas (loop [chunks [pending]]
+                                      (if-let [b (read-more! stream deadline)]
+                                        (recur (conj chunks b))
+                                        chunks)))))
          conn-hdr (str/lower-case (str (header-ci header-pairs "connection")))]
      {:status status
       :header-pairs header-pairs
       :body body
+      :body-pull body-pull
       ;; A connection can only be kept when the response said exactly how long
       ;; it was — read-to-close framing IS the close — and the peer did not ask
       ;; to close it. HTTP/1.0 is the other way round: not persistent unless it

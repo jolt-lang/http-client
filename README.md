@@ -65,8 +65,9 @@ not merely stored:
   Basic credentials.
 - **`:follow-redirects`** — `:never` / `:normal` / `:always`, with `:normal`
   refusing an https→http downgrade like `java.net.http`.
-- **`:connect-timeout`**, and per-request `:timeout`, which bounds the whole
-  exchange.
+- **`:connect-timeout`**, and per-request `:timeout`, which bounds the exchange
+  up to the response. It does not cut a body that is already arriving, the same
+  as `HttpRequest.timeout` on the JVM — see `:as :stream` below.
 
 Not emulated: HTTP/2 (`:version :http2` is accepted and the exchange is
 HTTP/1.1), request `:priority`, and a caller-supplied `:executor` — the async
@@ -74,11 +75,31 @@ send runs on jolt's own future pool. Each is recorded on the client and read
 back, so a caller that sets and inspects one sees what it set. WebSocket
 negotiates no extensions, so no `permessage-deflate`.
 
-Response bodies are read in full before the response is returned, so `:as
-:stream` hands back a stream over the complete body rather than a live one. It
-behaves like the JDK's for anything finite — `slurp`, `io/copy` and `io/reader`
-all work on it — but a response that never ends, such as an SSE feed, never
-returns. Restricted request headers behave as `java.net.http` does: setting
+`:as :stream` (`BodyHandlers/ofInputStream`) is live **on jolt 0.8.8 and up**:
+the response comes back as soon as the headers are in and the body is pulled off the socket as it is read,
+so an SSE feed, an LLM token stream or a log tail works. The stream is framed by
+the response — `Content-Length`, chunked, or the peer's close — so it ends where
+the body ends. `slurp`, `io/copy`, `io/reader` and `mark`/`reset` all work on it.
+
+What bounds a streamed body is inactivity, not total duration: the socket read
+timeout (the per-request `:timeout`) applies between reads, and `:timeout` itself
+does not end a body that keeps arriving, matching `java.net.http`. For a hard
+total cap, `jolt.http.platform/set-max-response-ms!` still applies to every
+response, streamed or not.
+
+The live stream is a reify `java.io.InputStream`, which needs the abstract-class
+method inheritance jolt gained in 0.8.8. Below that — the declared floor is
+0.8.1 — the transport probes for one, does not find it, and keeps reading bodies
+to completion, so `:as :stream` is a stream over a finished body as it was
+before. CI runs both.
+
+Two things to know. The connection belongs to the stream until the body is read
+to its end or the stream is closed, so a caller that abandons a stream should
+`.close` it. And `line-seq` reads its reader to the end on jolt today, so read a
+live stream with `.readLine` on a `BufferedReader` rather than through
+`line-seq` until jolt's own `line-seq` is lazy.
+
+Restricted request headers behave as `java.net.http` does: setting
 `content-length`, `connection`, `host`, `upgrade` or `expect` on a request is an
 `IllegalArgumentException`, because the client owns them.
 

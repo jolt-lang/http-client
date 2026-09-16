@@ -14,12 +14,26 @@ on: [push, pull_request]
 #
 # The pin is the DECLARED FLOOR, not the newest release, so CI tests the oldest
 # jolt deps.edn claims to support. Raise both together.
+#
+# 0.8.8 runs alongside it because one behaviour is version-gated rather than
+# absent below the floor: `:as :stream` hands back a LIVE body, and that stream
+# is a reify java.io.InputStream, which needs the abstract-class method
+# inheritance jolt gained in 0.8.8. Below it the transport probes for one, does
+# not find it, and keeps the buffered path — supported, and what the floor leg
+# tests. Testing only the floor would leave the live path uncovered; testing
+# only 0.8.8 would let the fallback rot. Both legs run the same suites, and the
+# streaming cases assert whichever contract is in force.
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        jolt: ['0.8.1', '0.8.8']
+    name: test (jolt ${{ matrix.jolt }})
     env:
-      JOLT_VERSION: '0.8.1'
+      JOLT_VERSION: ${{ matrix.jolt }}
     steps:
       - uses: actions/checkout@v4
       - name: Install jolt
