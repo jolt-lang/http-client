@@ -5,8 +5,21 @@
   assertions are about the HTTP client, not about a JSON codec."
   (:require [clojure.string :as str]
             [jolt.http.core :as core]
-            [jolt.http.test-server :as srv]
-            [jolt.http.zlib :as zlib]))
+            [jolt.http.test-server :as srv])
+  (:import [java.io ByteArrayOutputStream]
+           [java.util.zip Deflater DeflaterOutputStream GZIPOutputStream]))
+
+;; The compressed bodies, through the runtime's java.util.zip: gzip, zlib-framed
+;; deflate, and the raw deflate a fair share of servers send under
+;; `Content-Encoding: deflate`.
+(defn- compress [^bytes b make-stream]
+  (let [out (ByteArrayOutputStream.)]
+    (with-open [s (make-stream out)] (.write s b))
+    (.toByteArray out)))
+(defn- gzip-bytes [^bytes b] (compress b #(GZIPOutputStream. %)))
+(defn- zlib-bytes [^bytes b] (compress b #(DeflaterOutputStream. %)))
+(defn- raw-deflate-bytes [^bytes b]
+  (compress b #(DeflaterOutputStream. % (Deflater. Deflater/DEFAULT_COMPRESSION true))))
 
 ;; /stream-ticks: how long the body takes to arrive, and in how many pieces.
 ;; Read by the streaming tests, which assert against these.
@@ -61,19 +74,19 @@
       (= uri "/gzip")
       {:status 200
        :headers {"content-type" "text/plain" "content-encoding" "gzip"}
-       :body (zlib/gzip (.getBytes "gzipped body" "UTF-8"))}
+       :body (gzip-bytes (.getBytes "gzipped body" "UTF-8"))}
 
       (= uri "/deflate")
       {:status 200
        :headers {"content-type" "text/plain" "content-encoding" "deflate"}
-       :body (zlib/zlib-deflate (.getBytes "deflated body" "UTF-8"))}
+       :body (zlib-bytes (.getBytes "deflated body" "UTF-8"))}
 
       ;; the framing servers actually send about half the time, and the one a
       ;; default Inflater cannot read
       (= uri "/raw-deflate")
       {:status 200
        :headers {"content-type" "text/plain" "content-encoding" "deflate"}
-       :body (zlib/raw-deflate (.getBytes "raw deflated body" "UTF-8"))}
+       :body (raw-deflate-bytes (.getBytes "raw deflated body" "UTF-8"))}
 
       (= uri "/bearer")
       (if-let [token (second (re-find #"^Bearer (.+)$" (or (get h "authorization") "")))]
