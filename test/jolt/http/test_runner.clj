@@ -8,6 +8,7 @@
   one that starts the servers — must be the winning :once fixture."
   (:require [jolt.http.platform]                 ;; installs the host shims
             [clojure.test :as t]
+            [jolt.http.deps-test]
             [jolt.http.stream-shim-test]
             [jolt.http.core-test]
             [clj-http.lite.links-test]

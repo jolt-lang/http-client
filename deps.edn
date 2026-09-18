@@ -87,15 +87,20 @@
  ;; libcrypto come from jolt-crypto, loaded before these namespaces so the
  ;; foreign-fn bindings in jolt.http.tls resolve.
  ;;
- ;; A platform with no key here is searched for NOTHING — jolt.main/load-natives!
- ;; reads exactly the key the running platform selects — so declaring only
- ;; :darwin/:linux made every dependent app fail on Windows with "required native
- ;; library z not found — tried []", however completely zlib1.dll was on PATH
- ;; (jolt-lang/jolt#990). zlib1.dll is the name zlib's own Windows builds ship
- ;; (Git for Windows, winlibs and vcpkg all use it) and it cannot be derived from
- ;; "z" by any convention, so naming it here is the only way an app gets gzip on
- ;; Windows. The names are bare, so the standard loader search order applies: the
- ;; DLL beside jolt.exe and anywhere on PATH both work.
+ ;; Every platform jolt can select needs a key. jolt.main/load-natives! reads
+ ;; exactly the key the running platform selects, and through jolt 0.8.8 a
+ ;; missing key meant a search for NOTHING: declaring only :darwin/:linux made
+ ;; every dependent app fail on Windows with "required native library z not
+ ;; found — tried []", however completely zlib1.dll was on PATH
+ ;; (jolt-lang/jolt#990). Later jolts fall back to the conventional spellings
+ ;; (z.dll, libz.dll, and a glob for z-*.dll / libz-*.dll), which is no help
+ ;; either: zlib1.dll is the name zlib's own Windows builds ship (Git for
+ ;; Windows, winlibs and vcpkg all use it) and no convention derives it from
+ ;; "z", so naming it here is the only way an app gets gzip on Windows. z.dll and
+ ;; libz.dll follow because a declared key replaces that fallback rather than
+ ;; adding to it. The names are bare, so the standard loader search order
+ ;; applies: the DLL beside jolt.exe and anywhere on PATH both work.
+ ;; test/jolt/http/deps_test.clj holds the declaration to this.
  :jolt/native [{:name "libc (POSIX sockets)" :process true}
                {:name "z"
                 :darwin  ["libz.dylib" "/usr/lib/libz.dylib"]
