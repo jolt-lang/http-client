@@ -155,10 +155,12 @@ request.
 
 ## Requirements
 
-- jolt 0.8.1 or newer, declared as `:jolt/min-version`. 0.8.1 is where
-  `java.util.concurrent`'s executor interfaces entered jolt's class graph;
-  without them `babashka.http-client`'s `->Executor` builds a pool that answers
-  false to `(instance? ThreadPoolExecutor …)`.
+- jolt 0.8.9 or newer, declared as `:jolt/min-version`. 0.8.9 is where
+  `java.util.zip` entered the runtime, on the zlib every jolt binary links;
+  this library's gzip and deflate decoding runs on those classes and no
+  longer ships a libz shim of its own. (The earlier floor, 0.8.1, was
+  `java.util.concurrent`'s executor interfaces, which
+  `babashka.http-client`'s `->Executor` needs.)
 - OpenSSL (`libssl`/`libcrypto`) for https.
 
 ## Namespaces
