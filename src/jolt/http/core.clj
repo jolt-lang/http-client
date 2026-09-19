@@ -631,6 +631,14 @@
 ;; mid-flight on jolt and succeed on the JVM (jolt-lang/jolt#1017). What bounds a
 ;; streamed body is the socket's own read timeout — inactivity, which is what an
 ;; SSE reader wants — plus set-max-response-ms!, which an app asks for by name.
+;;
+;; On the java.net.http path even the socket timeout is wrong for the body,
+;; because it IS the request timeout and java.net.http cancels that when the
+;; headers land: an SSE feed that idled past :timeout died as
+;; SocketTimeoutException on jolt and streamed forever on the JVM
+;; (jolt-lang/http-client#26). So that path clears SO_RCVTIMEO after the header
+;; read, and the body is bounded by nothing but set-max-response-ms! and the
+;; caller.
 
 (defn- sized-pull
   "Pulls a Content-Length body, `len` bytes, in the pieces it arrives in."
@@ -840,12 +848,21 @@
   read up to the end of the headers, because a total bound over a body still
   arriving is the divergence jolt-lang/jolt#1017 is about. A body that cannot
   stream (a HEAD/204/304, or a Content-Length of 0) comes back buffered, as it
-  always did."
+  always did.
+
+  `body-unbounded?` is the java.net.http semantics (jolt-lang/http-client#26):
+  the request timeout is done the moment the headers are in, so the socket's
+  SO_RCVTIMEO is cleared after the header read and the body — buffered or
+  streamed — is cut by neither the request deadline nor the socket read
+  timeout, only by set-max-response-ms! and the caller. A caller that drains
+  such a body itself (a redirect hop) re-arms a timeout first."
   ([stream] (read-response stream nil "GET" nil false))
   ([stream deadline] (read-response stream deadline "GET" nil false))
   ([stream deadline method] (read-response stream deadline method nil false))
   ([stream deadline method received] (read-response stream deadline method received false))
   ([stream deadline method received stream-body?]
+   (read-response stream deadline method received stream-body? false))
+  ([stream deadline method received stream-body? body-unbounded?]
    (let [deadline (effective-deadline deadline)
          read-more! (fn [stream deadline]
                       (let [b (read-more! stream deadline)]
@@ -874,31 +891,39 @@
          chunked? (and te (str/includes? (str/lower-case te) "chunked"))
          len (when-not chunked?
                (parse-long (str/trim (or (header-ci header-pairs "content-length") ""))))
-         ;; An empty body is not worth a stream, and a bodyless response has
-         ;; nothing to stream: both keep the buffered path, so a caller always
-         ;; gets either :body or :body-pull and never neither.
-         stream? (boolean (and stream-body?
-                               reify-input-streams?
-                               (not (bodyless? method status))
-                               (not (and len (zero? len)))))
-         ;; Not `deadline`: see the docstring. set-max-response-ms! still
-         ;; applies — an app that asks for a total cap by name gets one.
-         body-deadline (when stream? (effective-deadline nil))
-         body-pull (when stream?
-                     (cond
-                       chunked? (chunked-pull stream pending body-deadline)
-                       (and len (pos? len)) (sized-pull stream pending len body-deadline)
-                       :else (to-close-pull stream pending body-deadline)))
-         body (when-not stream?
-                (cond
-                  (bodyless? method status) (byte-array 0)
-                  chunked? (read-chunked stream pending deadline)
-                  (and len (>= len 0)) (read-sized stream pending len deadline)
-                  ;; no framing at all: the peer's close is the delimiter
-                  :else (concat-bas (loop [chunks [pending]]
-                                      (if-let [b (read-more! stream deadline)]
-                                        (recur (conj chunks b))
-                                        chunks)))))
+          ;; An empty body is not worth a stream, and a bodyless response has
+          ;; nothing to stream: both keep the buffered path, so a caller always
+          ;; gets either :body or :body-pull and never neither.
+          stream? (boolean (and stream-body?
+                                reify-input-streams?
+                                (not (bodyless? method status))
+                                (not (and len (zero? len)))))
+          ;; The headers are in, so on the java.net.http path the request
+          ;; timeout's job is done: java.net.http cancels it there (measured:
+          ;; ofString against a body completing 5s past an 800ms timeout
+          ;; returns normally), and leaving our SO_RCVTIMEO armed past the
+          ;; headers cut a slow body at the timeout — the #26 divergence.
+          _ (when body-unbounded? (set-stream-timeout! stream nil))
+          ;; Not `deadline`: see the docstring. set-max-response-ms! still
+          ;; applies — an app that asks for a total cap by name gets one — and
+          ;; body-unbounded? extends the cap-only rule to the buffered body,
+          ;; where the request deadline must not cut either.
+          body-deadline (if body-unbounded? (effective-deadline nil) deadline)
+          body-pull (when stream?
+                      (cond
+                        chunked? (chunked-pull stream pending body-deadline)
+                        (and len (pos? len)) (sized-pull stream pending len body-deadline)
+                        :else (to-close-pull stream pending body-deadline)))
+          body (when-not stream?
+                 (cond
+                   (bodyless? method status) (byte-array 0)
+                   chunked? (read-chunked stream pending body-deadline)
+                   (and len (>= len 0)) (read-sized stream pending len body-deadline)
+                   ;; no framing at all: the peer's close is the delimiter
+                   :else (concat-bas (loop [chunks [pending]]
+                                       (if-let [b (read-more! stream body-deadline)]
+                                         (recur (conj chunks b))
+                                         chunks)))))
          conn-hdr (str/lower-case (str (header-ci header-pairs "connection")))]
      {:status status
       :header-pairs header-pairs

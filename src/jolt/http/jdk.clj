@@ -522,20 +522,25 @@
   this returns, so the connection is neither pooled nor closed here. Ownership
   passes to the caller through `:release!`, which takes true when the body was
   read to its end and false otherwise."
-  [stream absolute? key {:keys [url method headers body deadline stream-body?]} received]
+  [stream absolute? key {:keys [url method headers body deadline stream-body? body-unbounded?]} received]
   (let [ok (atom false)
         streaming (atom false)]
     (try
       (core/s-write stream (core/build-request method url headers body
                                                (when absolute? (core/spec-no-ref url))))
-      (let [resp (core/read-response stream deadline method received (boolean stream-body?))]
+      (let [resp (core/read-response stream deadline method received
+                                     (boolean stream-body?) (boolean body-unbounded?))]
         (if (:body-pull resp)
           (do (reset! streaming true)
-              (assoc resp :release!
-                     (fn [complete?]
-                       (if (and complete? (:reusable? resp))
-                         (core/pool-release! key stream)
-                         (try (core/s-close stream) (catch Throwable _ nil))))))
+              (-> resp
+                  ;; for a caller that drains this body itself (a redirect hop)
+                  ;; and wants the socket timeout back first
+                  (assoc :stream stream)
+                  (assoc :release!
+                         (fn [complete?]
+                           (if (and complete? (:reusable? resp))
+                             (core/pool-release! key stream)
+                             (try (core/s-close stream) (catch Throwable _ nil)))))))
           (do (reset! ok (:reusable? resp))
               resp)))
       (finally
@@ -554,8 +559,13 @@
   peer resets the socket's inactivity timeout forever, which is the whole reason
   there is a total deadline. Past it the connection is simply dropped — the next
   hop then fails on the same deadline, as it did before any of this streamed."
-  [resp deadline]
+  [resp deadline read-timeout]
   (when-let [pull (:body-pull resp)]
+    ;; read-response cleared SO_RCVTIMEO for an unbounded body; nobody is
+    ;; reading this one, so the timeout is re-armed before the drain — the
+    ;; absolute deadline only fires between reads, and a read parked on a
+    ;; silent peer would never come back to check it.
+    (when read-timeout (core/set-stream-timeout! (:stream resp) read-timeout))
     (let [complete? (try (loop []
                            (cond
                              (nil? (pull)) true
@@ -641,12 +651,16 @@
            retried-auth? false]
       (let [prx (select-proxy selector uri)
             hdrs (request-headers (or (tget request :headers) []) uri cookie-handler auth-header)
-            resp (exchange {:url url :method method :headers hdrs :body body
-                            :read-timeout req-timeout :conn-timeout conn-timeout
-                            :insecure? insecure? :proxy prx :ssl ssl :deadline deadline
-                            ;; Only ofInputStream wants a live body; every other
-                            ;; handler hands back a value that is the whole thing.
-                            :stream-body? (= handler :jolt.http/handler-inputstream)})
+             resp (exchange {:url url :method method :headers hdrs :body body
+                             :read-timeout req-timeout :conn-timeout conn-timeout
+                             :insecure? insecure? :proxy prx :ssl ssl :deadline deadline
+                             ;; Only ofInputStream wants a live body; every other
+                             ;; handler hands back a value that is the whole thing.
+                             :stream-body? (= handler :jolt.http/handler-inputstream)
+                             ;; java.net.http cancels HttpRequest.timeout once the
+                             ;; response headers arrive; the body is bounded only
+                             ;; by set-max-response-ms! and the caller (#26).
+                             :body-unbounded? (boolean req-timeout)})
             pairs (:header-pairs resp)]
         (when cookie-handler
           (cookie-manager-put! cookie-handler uri (headers->map pairs)))
@@ -658,7 +672,7 @@
             ;; 401 with an authenticator configured: retry the same request once
             ;; with credentials, which is what java.net.http's Authenticator does.
             (and (= 401 status) (not retried-auth?) auth-retry)
-              (do (discard-body! resp deadline)
+              (do (discard-body! resp deadline req-timeout)
                   (recur uri url method body auth-retry redirects true))
 
             (and loc (core/redirect-statuses status) (< redirects 20)
@@ -668,7 +682,7 @@
                     ;; to GET and drops the body.
                     to-get? (or (= 303 status)
                                 (and (#{301 302} status) (not (#{"GET" "HEAD"} method))))]
-                (discard-body! resp deadline)
+                (discard-body! resp deadline req-timeout)
                 (recur (java.net.URI/create (tget to :spec)) to
                        (if to-get? "GET" method)
                        (if to-get? nil body)
