@@ -2,12 +2,14 @@
  ;; two spellings are both integers — an older runtime writes to the wrong
  ;; place rather than failing. Declare the floor so it refuses instead.
  ;;
- ;; 0.8.1 rather than 0.8.0 because that is where java.util.concurrent's executor
- ;; and future interfaces entered jolt's class graph: on 0.8.0 the pool
- ;; babashka.http-client's `->Executor` builds answers false to
- ;; (instance? java.util.concurrent.ThreadPoolExecutor …), so a caller that
- ;; type-checks its own :executor rejects a working one.
- :jolt/min-version "0.8.1"
+ ;; 0.8.9 is where java.util.zip entered the runtime: this library used to
+ ;; supply GZIPInputStream and the deflate streams itself over the system libz,
+ ;; and stopped when jolt began to refuse a :jolt/provides claim on a class the
+ ;; runtime provides. An older jolt has neither the classes nor the refusal, so
+ ;; gzip responses would fail to decode there; the floor says so up front.
+ ;; (0.8.1 was the previous floor, for java.util.concurrent's executor and
+ ;; future interfaces, which babashka.http-client's `->Executor` type-checks.)
+ :jolt/min-version "0.8.9"
 
  :paths ["src"]
 
@@ -29,12 +31,7 @@
  ;; not claiming, and only the claim is checked.
  :jolt/provides
  {jolt.http.platform ["java.net.HttpURLConnection"
-                      "javax.net.ssl.HttpsURLConnection"
-                      "java.util.zip.GZIPInputStream"
-                      "java.util.zip.GZIPOutputStream"
-                      "java.util.zip.InflaterInputStream"
-                      "java.util.zip.DeflaterInputStream"
-                      "java.util.zip.Inflater"]
+                      "javax.net.ssl.HttpsURLConnection"]
   jolt.http.jdk ["java.net.http.HttpClient"
                  "java.net.http.HttpClient$Redirect"
                  "java.net.http.HttpClient$Version"
@@ -71,8 +68,9 @@
 
  ;; clj-http-lite straight from its git repo. Jolt ignores the org.clojure/clojure
  ;; dependency it declares; this library supplies the JVM host APIs clj-http-lite
- ;; needs (HttpURLConnection / URL / java.util.zip / javax.net.ssl) as Jolt host
- ;; shims, plus TLS (OpenSSL) and gzip (libz) through jolt.ffi.
+ ;; needs (HttpURLConnection / URL / javax.net.ssl) as Jolt host shims, plus TLS
+ ;; (OpenSSL) through jolt.ffi. java.util.zip is the runtime's own, on the zlib
+ ;; every jolt binary links.
  ;; clj-http-lite straight from git; jolt-lang/jolt-crypto carries the OpenSSL
  ;; (libssl/libcrypto) declarations + the java.security.SecureRandom shim TLS
  ;; needs — so this library and the ring adapter don't each redeclare them
@@ -83,29 +81,14 @@
         jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
                                :git/sha "44da69bad08a2fd7631bd4061e3fb53938dafff6"}}
 
- ;; libc (BSD sockets, the running process's symbols) and libz (gzip); libssl/
- ;; libcrypto come from jolt-crypto, loaded before these namespaces so the
- ;; foreign-fn bindings in jolt.http.tls resolve.
- ;;
- ;; Every platform jolt can select needs a key. jolt.main/load-natives! reads
- ;; exactly the key the running platform selects, and through jolt 0.8.8 a
- ;; missing key meant a search for NOTHING: declaring only :darwin/:linux made
- ;; every dependent app fail on Windows with "required native library z not
- ;; found — tried []", however completely zlib1.dll was on PATH
- ;; (jolt-lang/jolt#990). Later jolts fall back to the conventional spellings
- ;; (z.dll, libz.dll, and a glob for z-*.dll / libz-*.dll), which is no help
- ;; either: zlib1.dll is the name zlib's own Windows builds ship (Git for
- ;; Windows, winlibs and vcpkg all use it) and no convention derives it from
- ;; "z", so naming it here is the only way an app gets gzip on Windows. z.dll and
- ;; libz.dll follow because a declared key replaces that fallback rather than
- ;; adding to it. The names are bare, so the standard loader search order
- ;; applies: the DLL beside jolt.exe and anywhere on PATH both work.
- ;; test/jolt/http/deps_test.clj holds the declaration to this.
- :jolt/native [{:name "libc (POSIX sockets)" :process true}
-               {:name "z"
-                :darwin  ["libz.dylib" "/usr/lib/libz.dylib"]
-                :linux   ["libz.so.1" "libz.so"]
-                :windows ["zlib1.dll" "z.dll" "libz.dll"]}]
+ ;; libc (BSD sockets, the running process's symbols); libssl/libcrypto come
+ ;; from jolt-crypto, loaded before these namespaces so the foreign-fn bindings
+ ;; in jolt.http.tls resolve. No libz: java.util.zip is the runtime's, and a
+ ;; library that declared a zlib of its own here would only put a second zlib
+ ;; ahead of the one the runtime registered (jolt-lang/jolt#916). Every platform
+ ;; jolt can select needs a key on a shared-object native, and
+ ;; test/jolt/http/deps_test.clj holds the declarations to that.
+ :jolt/native [{:name "libc (POSIX sockets)" :process true}]
 
  ;; Tests run clj-http-lite's own client/links/integration suites under Jolt, with
  ;; in-process plaintext + TLS servers in place of the suite's Jetty subprocess.
@@ -116,9 +99,6 @@
            ;; servers on their own ports.
            :timeouttest {:extra-paths ["test"]
                          :main-opts ["-m" "jolt.http.timeout-runner"]}
-           ;; isolated zlib round-trip check (no clj-http-lite / sockets needed)
-           :zlibtest {:extra-paths ["test"]
-                      :main-opts ["-m" "jolt.http.zlib-test"]}
            ;; babashka.http-client, unmodified from Maven, over the java.net.http
            ;; shim. jolt-lang/multipart parses the multipart bodies the client
            ;; builds, so the test asserts on the parts rather than on a byte blob.
@@ -143,5 +123,4 @@
          bhctest "jolt -M:bhctest"
          wstest "jolt -M:wstest"
          tlstest "jolt -M:tlstest"
-         zlibtest "jolt -M:zlibtest"
          timeouttest "jolt -M:timeouttest"}}

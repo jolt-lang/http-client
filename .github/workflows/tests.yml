@@ -1,28 +1,20 @@
 name: tests
 on: [push, pull_request]
 # One pinned jolt, not whatever the latest release happens to be. The supported
-# floor is 0.8.1, which deps.edn declares as :jolt/min-version: jolt.ffi/write
-# takes the value before the offset from 0.8.0 on, and the two spellings are
-# both integers, so on 0.7.x the zlib path wrote to the wrong place and the
-# compressed-body tests crashed (then the server they left behind held port
-# 18091 and every later suite died on bind). 0.7.19 was the floor before that:
-# jolt.http.net reads errno through jolt.io-poller, and 0.7.19 is where jolt's
-# own java.io byte streams answer the full surface (readNBytes/transferTo/mark).
-# 0.8.1 raised it once more: that is where java.util.concurrent's executor
-# interfaces entered jolt's class graph, without which babashka.http-client's
-# ->Executor builds a pool that answers false to (instance? ThreadPoolExecutor).
+# floor is 0.8.9, which deps.edn declares as :jolt/min-version: that is where
+# java.util.zip entered the runtime, on the zlib every jolt binary links, and
+# where this library stopped shipping gzip/deflate shims of its own over the
+# system libz. An older jolt has neither the classes nor the runtime's answer
+# for them, so a gzip response would fail to decode there; the floor refuses
+# the project instead. Earlier floors, for the record: 0.8.1 (java.util.concurrent's
+# executor interfaces, which babashka.http-client's ->Executor type-checks),
+# 0.8.0 (jolt.ffi/write's argument order), 0.7.19 (jolt's own java.io byte
+# streams answering the full surface).
 #
 # The pin is the DECLARED FLOOR, not the newest release, so CI tests the oldest
-# jolt deps.edn claims to support. Raise both together.
-#
-# 0.8.8 runs alongside it because one behaviour is version-gated rather than
-# absent below the floor: `:as :stream` hands back a LIVE body, and that stream
-# is a reify java.io.InputStream, which needs the abstract-class method
-# inheritance jolt gained in 0.8.8. Below it the transport probes for one, does
-# not find it, and keeps the buffered path — supported, and what the floor leg
-# tests. Testing only the floor would leave the live path uncovered; testing
-# only 0.8.8 would let the fallback rot. Both legs run the same suites, and the
-# streaming cases assert whichever contract is in force.
+# jolt deps.edn claims to support. Raise both together. One leg is enough now:
+# the `:as :stream` live-body path that used to need a second, newer leg
+# (0.8.8's abstract-class method inheritance) is below the floor.
 
 jobs:
   test:
@@ -30,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        jolt: ['0.8.1', '0.8.8']
+        jolt: ['0.8.9']
     name: test (jolt ${{ matrix.jolt }})
     env:
       JOLT_VERSION: ${{ matrix.jolt }}
@@ -61,5 +53,3 @@ jobs:
         run: JOLT_PWD="$PWD" jolt -M:wstest
       - name: TLS
         run: JOLT_PWD="$PWD" jolt -M:tlstest
-      - name: zlib
-        run: JOLT_PWD="$PWD" jolt -M:zlibtest

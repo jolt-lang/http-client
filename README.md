@@ -2,7 +2,7 @@
 
 HTTP for [Jolt](https://github.com/jolt-lang/jolt): the JVM networking APIs that
 Clojure HTTP clients are written against, supplied as Jolt host shims over BSD
-sockets, OpenSSL and libz through `jolt.ffi`. Jolt has no JVM, so none of
+sockets and OpenSSL through `jolt.ffi`. Jolt has no JVM, so none of
 `java.net.URL`, `java.net.http.HttpClient` or `javax.net.ssl` exists until this
 library installs them — the same approach
 [jolt-lang/router](https://github.com/jolt-lang/router) uses for reitit.
@@ -40,9 +40,9 @@ require of ours could run.
 | `java.net.ProxySelector`, `Proxy`, `CookieManager`, `Authenticator` | real routing, not just constructors — see below |
 | `javax.net.ssl` (`SSLContext`, `SSLParameters`, trust managers, `KeyStore`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the socket (`jolt.http.tls`), including PKCS#12 key and trust stores |
 | `java.io` byte streams, `java.io.SequenceInputStream` | jolt's own streams where it has them, shims where it does not |
-| `java.util.zip` (gzip/deflate/raw deflate) | the system **libz** via `jolt.ffi` (`jolt.http.zlib`) |
 
-The native libraries (libc sockets, libz, OpenSSL) are declared in `deps.edn`
+`java.util.zip` (gzip, deflate, raw deflate) is jolt's own, on the zlib every
+jolt binary links. The native libraries (libc sockets, OpenSSL) are declared in `deps.edn`
 under `:jolt/native`; jolt loads them before the namespaces are required.
 
 ## Client options
@@ -155,11 +155,13 @@ request.
 
 ## Requirements
 
-- jolt 0.8.1 or newer, declared as `:jolt/min-version`. 0.8.1 is where
-  `java.util.concurrent`'s executor interfaces entered jolt's class graph;
-  without them `babashka.http-client`'s `->Executor` builds a pool that answers
-  false to `(instance? ThreadPoolExecutor …)`.
-- System `libz` (always present) and OpenSSL (`libssl`/`libcrypto`) for https.
+- jolt 0.8.9 or newer, declared as `:jolt/min-version`. 0.8.9 is where
+  `java.util.zip` entered the runtime, on the zlib every jolt binary links;
+  this library's gzip and deflate decoding runs on those classes and no
+  longer ships a libz shim of its own. (The earlier floor, 0.8.1, was
+  `java.util.concurrent`'s executor interfaces, which
+  `babashka.http-client`'s `->Executor` needs.)
+- OpenSSL (`libssl`/`libcrypto`) for https.
 
 ## Namespaces
 
@@ -169,7 +171,6 @@ request.
 | `jolt.http.core` | the HTTP/1.1 engine: transport, URL parser, request/response codec — shared, so the two client surfaces cannot drift |
 | `jolt.http.net` | BSD sockets over `jolt.ffi` |
 | `jolt.http.tls` | OpenSSL, including PKCS#12 stores and `CONNECT`-tunnel wrapping |
-| `jolt.http.zlib` | libz |
 | `jolt.http.platform` | `java.net.URL` / `HttpURLConnection` / byte streams / `java.util.zip`; requiring it installs everything |
 | `jolt.http.jdk` | `java.net.http` and the `java.net` / `javax.net.ssl` classes around it |
 | `jolt.http.websocket` | RFC 6455 |
@@ -194,7 +195,6 @@ jolt -M:wstest        # RFC 6455: the frame codec both directions, plus
 jolt -M:tlstest       # ssl-context, PKCS#12 key/trust stores, CONNECT
                       # tunnelling, wss — the server is self-signed, so the
                       # default client must refuse it
-jolt -M:zlibtest      # zlib round-trip, no sockets
 jolt -M:timeouttest   # timeout/deadline regressions; stalls connections on
                       # purpose. One case loads jolt.nrepl in a subprocess and
                       # fetches https://example.com, so it needs network egress.

@@ -2,19 +2,18 @@
   "Platform support for clj-http-lite on Jolt: a hand-rolled HTTP/1.1 client over
   jolt.http.net (BSD sockets via jolt.ffi), exposed as the java.net.URL /
   HttpURLConnection surface clj-http-lite drives, plus the java.io byte streams
-  and java.util.zip / SSL pieces it touches. Registers everything through Jolt's
-  host-shim hooks (__register-class-ctor! / __register-class-methods! /
+  and SSL pieces it touches. Registers everything through Jolt's host-shim
+  hooks (__register-class-ctor! / __register-class-methods! /
   __register-instance-check!) — like jolt-lang/router does for reitit.
 
-  https is handled by jolt.http.tls (OpenSSL); gzip/deflate by jolt.http.zlib
-  (libz). Shim objects are host tagged-tables; their fields are read/written with
-  jolt.host/ref-get / ref-put!."
+  https is handled by jolt.http.tls (OpenSSL); gzip/deflate by the runtime's
+  own java.util.zip, since jolt 0.8.9. Shim objects are host tagged-tables;
+  their fields are read/written with jolt.host/ref-get / ref-put!."
   (:require [clojure.string :as str]
             [jolt.crypto]                ;; java.security.SecureRandom (real, RAND_bytes)
             [jolt.http.core :as core]
             [jolt.http.jdk]              ;; side effect: installs the java.net.http surface
-            [jolt.http.websocket]        ;; side effect: installs java.net.http.WebSocket
-            [jolt.http.zlib :as zlib]))
+            [jolt.http.websocket]))      ;; side effect: installs java.net.http.WebSocket
 
 
 ;; --- engine ----------------------------------------------------------------
@@ -218,60 +217,6 @@
      "flush" (fn [self & _] nil)
      "reset" (fn [self] (tput! self :acc []) nil)
      "close" (fn [self & _] nil)})
-
-  ;; java.util.zip streams (eager: (de)compress whole payloads)
-  (doseq [nm ["GZIPInputStream" "java.util.zip.GZIPInputStream"]]
-    (__register-class-ctor! nm (fn [src & _] (make-bais (zlib/gunzip (->bytes src))))))
-  ;; (Inflater. nowrap?) carries one bit: whether the stream has a zlib header.
-  ;; InflaterInputStream's two-argument ctor is the only way a caller reaches raw
-  ;; deflate, and a server sending `Content-Encoding: deflate` is about as likely
-  ;; to mean raw as zlib — so the ONE-argument ctor auto-detects instead of
-  ;; failing, which is what the probe-then-retry dance around it exists to do.
-  ;; Detection happens here, at construction, rather than at the first read the
-  ;; way java.util.zip defers it: these shims decompress the whole payload up
-  ;; front, so there is no later read to fail in. A body that is neither framing
-  ;; still raises ZipException, just from the constructor.
-  (doseq [nm ["Inflater" "java.util.zip.Inflater"]]
-    (__register-class-ctor! nm (fn [& args] (doto (tt :jolt/inflater)
-                                              (tput! :nowrap (boolean (first args)))))))
-  (__register-class-methods! :jolt/inflater
-    {"setInput" (fn [self src & _] (tput! self :input (->bytes src)) nil)
-     "end" (fn [_self] nil)
-     "reset" (fn [_self] nil)
-     "finished" (fn [_self] true)})
-  (doseq [nm ["InflaterInputStream" "java.util.zip.InflaterInputStream"]]
-    (__register-class-ctor! nm
-      (fn [src & args]
-        (let [inflater (first args)
-              nowrap? (boolean (and (table? inflater)
-                                    (= :jolt/inflater (tget inflater :jolt/type))
-                                    (tget inflater :nowrap)))
-              bytes (->bytes src)]
-          (make-bais (if nowrap? (zlib/raw-inflate bytes) (zlib/inflate-auto bytes)))))))
-  (doseq [nm ["DeflaterInputStream" "java.util.zip.DeflaterInputStream"]]
-    (__register-class-ctor! nm (fn [src & _] (make-bais (zlib/zlib-deflate (->bytes src))))))
-  (doseq [nm ["GZIPOutputStream" "java.util.zip.GZIPOutputStream"]]
-    (__register-class-ctor! nm (fn [target & _]
-                                 (let [t (tt :jolt/gzip-out)]
-                                   (tput! t :jolt/output-stream true)
-                                   (tput! t :acc []) (tput! t :target target)
-                                   t))))
-  (__register-class-methods! :jolt/gzip-out
-    {"write" (fn [self x & args]
-               (let [acc (tget self :acc)]
-                 (cond
-                   (number? x) (tput! self :acc (conj acc (bit-and x 0xff)))
-                   (empty? args) (tput! self :acc (into acc (seq (->bytes x))))
-                   :else (let [off (first args) len (second args)]
-                           (tput! self :acc (into acc (take len (drop off (seq (->bytes x)))))))))
-               nil)
-     "flush" (fn [self & _] nil)
-     "finish" (fn [self & _] nil)
-     "close" (fn [self & _]
-               (let [target (tget self :target)
-                     gz (zlib/gzip (byte-array (tget self :acc)))]
-                 (.write target gz))   ;; append the gzipped payload to the target baos
-               nil)})
 
   ;; java.net.URL (full parser; superset of core's file:-only shim)
   (doseq [nm ["URL" "java.net.URL"]]

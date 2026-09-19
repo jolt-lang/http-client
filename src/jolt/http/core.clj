@@ -781,11 +781,10 @@
       ;;
       ;; `readlimit` is not honoured, deliberately. The JVM treats it as the
       ;; point past which a mark MAY be dropped and BufferedInputStream keeps
-      ;; more than asked; here the reader that resets is one whose first act is
-      ;; to drain — our InflaterInputStream decompresses whole payloads up front
-      ;; — so dropping the mark at babashka's 512 would break every deflate
-      ;; response longer than that. The cost is that a marked stream buffers
-      ;; what is read until the mark is dropped, which .reset does.
+      ;; more than asked; honouring babashka's 512 here would drop the mark
+      ;; under a reader that read further before resetting. The cost is that a
+      ;; marked stream buffers what is read until the mark is dropped, which
+      ;; .reset does.
       (markSupported [_] true)
       (mark [_ _readlimit] (reset! marked []) nil)
       (reset [_]
