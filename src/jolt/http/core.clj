@@ -412,8 +412,9 @@
     ;; Thrown, so perform!'s finally closes the stream. That is what stops a
     ;; trickling peer leaking a socket and a parked thread per attempt.
     (throw-typed "java.net.SocketTimeoutException"
-                 (str "Response exceeded the total time limit of "
-                      (or @max-response-ms "the request timeout") "ms"))))
+                 (if-let [cap @max-response-ms]
+                   (str "Response exceeded the total time limit of " cap "ms")
+                   "Response exceeded the request timeout"))))
 
 (defn recv-all
   "Drain `stream` to a byte-array. `deadline`, when given, is an absolute
@@ -904,11 +905,12 @@
           ;; returns normally), and leaving our SO_RCVTIMEO armed past the
           ;; headers cut a slow body at the timeout — the #26 divergence.
           _ (when body-unbounded? (set-stream-timeout! stream nil))
-          ;; Not `deadline`: see the docstring. set-max-response-ms! still
-          ;; applies — an app that asks for a total cap by name gets one — and
-          ;; body-unbounded? extends the cap-only rule to the buffered body,
-          ;; where the request deadline must not cut either.
-          body-deadline (if body-unbounded? (effective-deadline nil) deadline)
+          ;; Not `deadline` for a streamed body: see the docstring.
+          ;; set-max-response-ms! still applies — an app that asks for a total
+          ;; cap by name gets one — and body-unbounded? extends the cap-only
+          ;; rule to the buffered body, where the request deadline must not cut
+          ;; either.
+          body-deadline (if (or stream? body-unbounded?) (effective-deadline nil) deadline)
           body-pull (when stream?
                       (cond
                         chunked? (chunked-pull stream pending body-deadline)
