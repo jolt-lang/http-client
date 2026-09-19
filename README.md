@@ -81,11 +81,14 @@ so an SSE feed, an LLM token stream or a log tail works. The stream is framed by
 the response — `Content-Length`, chunked, or the peer's close — so it ends where
 the body ends. `slurp`, `io/copy`, `io/reader` and `mark`/`reset` all work on it.
 
-What bounds a streamed body is inactivity, not total duration: the socket read
-timeout (the per-request `:timeout`) applies between reads, and `:timeout` itself
-does not end a body that keeps arriving, matching `java.net.http`. For a hard
-total cap, `jolt.http.platform/set-max-response-ms!` still applies to every
-response, streamed or not.
+What bounds a streamed body is inactivity, not total duration. On the
+`clj-http-lite` side that is still the socket read timeout (`:socket-timeout`,
+between reads). On the `babashka.http-client` side it is nothing at all by
+default: `HttpRequest.timeout` is cancelled once the response headers arrive,
+exactly as `java.net.http` behaves, so a body read that outlives it blocks on
+rather than being cut (#26). For a hard total cap,
+`jolt.http.platform/set-max-response-ms!` still applies to every response,
+streamed or not.
 
 The live stream is a reify `java.io.InputStream`, which needs the abstract-class
 method inheritance jolt gained in 0.8.8. Below that — the declared floor is
@@ -149,9 +152,10 @@ macOS, ~130s on Linux). `:socket-timeout` bounds each individual read.
 Neither bounds a peer that keeps trickling bytes: every read beats the read
 timeout, so the response never ends. `(jolt.http.platform/set-max-response-ms!
 ms)` caps the total wall-clock time of a response body across all reads. It
-applies process-wide, and is nil (uncapped) by default. On the
-`babashka.http-client` side, a per-request `:timeout` does the same thing for one
-request.
+applies process-wide, and is nil (uncapped) by default. A per-request
+`:timeout` on the `babashka.http-client` side does not do this: like
+`HttpRequest.timeout`, it is cancelled once the response headers arrive and
+leaves an arriving body alone.
 
 ## Requirements
 

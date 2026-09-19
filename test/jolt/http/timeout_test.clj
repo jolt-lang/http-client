@@ -308,11 +308,116 @@
       (let [t0 (System/currentTimeMillis)
             outcome (try (http/get (str "http://127.0.0.1:" port "/get")
                                    {:socket-timeout 800})
-                         :returned
-                         (catch Throwable e (class e)))
+                          :returned
+                          (catch Throwable e (class e)))
             elapsed (- (System/currentTimeMillis) t0)]
         (is (= java.net.SocketTimeoutException outcome)
             "slicing the wait does not change what a silent peer surfaces as")
         (is (< 700 elapsed 4000)
             (str "and the bound is still the socket timeout, not a slice; took " elapsed "ms")))
+      (finally (reset! (:running srv) false) (net/close (:fd srv))))))
+
+;; --- HttpRequest.timeout must not cut a body already in flight --------------
+;; java.net.http's request timeout is cancelled the moment the response HEADERS
+;; arrive; the JVM's ofInputStream hands the body back and an in-flight read is
+;; not bounded by it, and ofString finishes a trickling body past the timeout
+;; too (measured: 800ms timeout, body completing at 6s, send returns normally).
+;; The shim applied it as SO_RCVTIMEO over the whole exchange, so a streamed
+;; body read threw SocketTimeoutException "Read timed out" at the timeout and a
+;; buffered one failed mid-body (jolt-lang/http-client#26). These regressions
+;; pin the JVM behaviour for both handlers.
+
+(defn- start-pausing-plain
+  "Accepts, reads the request, sends headers promising `len` body bytes, then
+  sends `pause-ms` of silence before the body — and, unless :close-after?, the
+  body itself."
+  [port len pause-ms]
+  (let [fd (srv/listen-socket port)
+        running? (atom true)
+        conns (atom [])]
+    (future
+      (loop []
+        (let [raw (srv/accept-raw fd)]
+          (when @running?
+            (when-not (neg? raw)
+              (swap! conns conj raw)
+              (future
+                (try
+                  (net/recv-bytes raw)            ; the request
+                  (net/send-bytes raw (.getBytes (str "HTTP/1.1 200 OK\r\nContent-Length: " len "\r\n\r\n")))
+                  (Thread/sleep pause-ms)
+                  (when (pos? len)
+                    (net/send-bytes raw (byte-array (repeat len (int \x))))
+                    ;; hold the connection open, like a keep-alive server would
+                    (Thread/sleep 60000))
+                  (catch Throwable _ nil))))
+              (recur)))))
+    {:fd fd :port port :running running? :conns conns}))
+
+(defn- jdk-request [port timeout-ms]
+  (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create (str "http://127.0.0.1:" port "/")))
+      (.timeout (java.time.Duration/ofMillis timeout-ms))
+      (.GET)
+      (.build)))
+
+(defn- jdk-client []
+  (java.net.http.HttpClient/newHttpClient))
+
+(deftest request-timeout-does-not-cut-a-streamed-body
+  ;; The repro from #26, verbatim in shape: headers arrive, the body pauses past
+  ;; the timeout, and the first body read must still return once bytes arrive —
+  ;; not throw SocketTimeoutException at the timeout.
+  (let [port 18083
+        srv (start-pausing-plain port 100 3000)]
+    (try
+      (let [resp (.send (jdk-client) (jdk-request port 800)
+                        (java.net.http.HttpResponse$BodyHandlers/ofInputStream))
+            body (.body resp)
+            t0 (System/currentTimeMillis)
+            outcome (try [(int (.read body)) (- (System/currentTimeMillis) t0)]
+                         (catch Throwable e [(class e) (- (System/currentTimeMillis) t0)]))]
+        (is (= (int \x) (first outcome))
+            (str "the read must return the first body byte, got " (pr-str outcome)))
+        (is (> (second outcome) 1500)
+            (str "the read blocked through the pause (took " (second outcome) "ms), not cut at the 800ms timeout")))
+      (finally (reset! (:running srv) false)
+               (net/close (:fd srv))
+               (doseq [c @(:conns srv)] (try (net/close c) (catch Throwable _ nil)))))))
+
+(deftest request-timeout-does-not-cut-a-buffered-body
+  ;; ofString over the same pausing peer: the whole body lands past the 800ms
+  ;; request timeout and send still returns it.
+  (let [port 18084
+        srv (start-pausing-plain port 20 3000)]
+    (try
+      (let [t0 (System/currentTimeMillis)
+            outcome (try (let [resp (.send (jdk-client) (jdk-request port 800)
+                                            java.net.http.HttpResponse$BodyHandlers/ofString)]
+                           [(.statusCode resp) (count (.body resp)) (- (System/currentTimeMillis) t0)])
+                         (catch Throwable e [(class e) (- (System/currentTimeMillis) t0)]))]
+        (is (= [200 20] (butlast outcome))
+            (str "send must return the complete body past the timeout, got " (pr-str outcome)))
+        (is (> (last outcome) 1500)
+            (str "send blocked through the pause (took " (last outcome) "ms)")))
+      (finally (reset! (:running srv) false)
+               (net/close (:fd srv))
+               (doseq [c @(:conns srv)] (try (net/close c) (catch Throwable _ nil)))))))
+
+(deftest request-timeout-still-bounds-the-headers-phase
+  ;; Alignment is not "no timeout": a peer that never sends headers must still
+  ;; fail at the request timeout, exactly as java.net.http throws
+  ;; HttpTimeoutException there.
+  (let [port 18085
+        srv (start-stalling-plain port)]
+    (try
+      (let [t0 (System/currentTimeMillis)
+            outcome (try (.send (jdk-client) (jdk-request port 800)
+                                 (java.net.http.HttpResponse$BodyHandlers/ofString))
+                         :returned
+                         (catch Throwable e (class e)))
+            elapsed (- (System/currentTimeMillis) t0)]
+        (is (some? outcome))
+        (is (not= :returned outcome) "a silent peer must fail, not return")
+        (is (< 700 elapsed 4000)
+            (str "and near the 800ms request timeout, took " elapsed "ms")))
       (finally (reset! (:running srv) false) (net/close (:fd srv))))))

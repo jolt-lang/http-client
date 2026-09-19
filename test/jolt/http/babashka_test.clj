@@ -545,6 +545,19 @@
               resp (core/read-response st nil "GET" nil true)]
           (is (thrown? java.io.IOException (pulled resp))))))))
 
+(deftest streamed-body-is-not-bounded-by-the-request-deadline
+  (testing "`deadline` bounds only the headers of a streamed body, whatever body-unbounded? says"
+    ;; The docstring's promise for stream-body?, and jolt-lang/jolt#1017's
+    ;; point: a body still arriving is not cut by the request deadline. It held
+    ;; through body-deadline being cap-only for every stream; with #26 that
+    ;; became conditional on body-unbounded?, so a streamed body pulled with a
+    ;; deadline and body-unbounded? false hit check-deadline! and died.
+    (when live?
+      (let [st (scripted-stream ["HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n" "hello"])
+            resp (core/read-response st (+ (System/currentTimeMillis) 50) "GET" nil true false)]
+        (Thread/sleep 150)
+        (is (= "hello" (pulled resp)))))))
+
 (deftest chunked-trailers-are-consumed
   (testing "a trailer that arrives after the terminal chunk is taken off the wire"
     ;; A connection is reusable after a chunked body, so anything left of this
@@ -585,15 +598,13 @@
   (testing ":timeout bounds the time to the response, and does not cut a body in flight"
     ;; jolt-lang/jolt#1017. On the JVM java.net.http's HttpRequest.timeout does
     ;; not end a body that is still arriving; a total deadline over the body
-    ;; killed every stream that ran longer than it. The buffered fallback still
-    ;; applies that deadline to the whole response, which is the divergence
-    ;; itself — asserted here rather than left implied.
-    (let [get! #(http/get (str base "/stream-ticks") {:as :stream :timeout (quot ticks-ms 2)})]
-      (if live?
-        (let [r (get!)]
-          (is (= 200 (:status r)))
-          (is (= routes/ticks-body (slurp (:body r)))))
-        (is (thrown? java.net.SocketTimeoutException (get!)))))))
+    ;; killed every stream that ran longer than it. The buffered fallback used
+    ;; to keep that deadline over the whole response; since #26 the timeout is
+    ;; done once the headers are in on both paths, so the body comes back whole
+    ;; either way.
+    (let [r (http/get (str base "/stream-ticks") {:as :stream :timeout (quot ticks-ms 2)})]
+      (is (= 200 (:status r)))
+      (is (= routes/ticks-body (slurp (:body r)))))))
 
 (deftest stream-body-closed-early
   (testing "closing a partly-read body gives the connection up and reads as EOF"
