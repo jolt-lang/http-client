@@ -20,8 +20,12 @@
     (testing "the socket level and options are the BSD/Winsock numbers"
       (is (= 0xffff (:sol-socket c)) "SOL_SOCKET is 0xffff on Winsock, 1 on Linux")
       (is (= 0x1006 (:so-rcvtimeo c)) "SO_RCVTIMEO")
-      (is (= 0x1007 (:so-error c)) "SO_ERROR")
-      (is (= 0x4004667F (:fionread c)) "the BSD _IOR encoding of FIONREAD"))
+      (is (= 0x1007 (:so-error c)) "SO_ERROR"))
+    (testing "WSAPoll's event bits are Winsock's, not poll(2)'s"
+      ;; POSIX POLLIN/POLLOUT (1/4) are POLLERR/POLLNVAL to WSAPoll, which
+      ;; refuses them in events with WSAEINVAL — every read would fail.
+      (is (= 0x0100 (:pollin c)) "POLLRDNORM")
+      (is (= 0x0010 (:pollout c)) "POLLWRNORM"))
     (testing "failures are WSA codes, never ucrt errno"
       (is (= 10004 (:eintr c)) "WSAEINTR")
       (is (= 10035 (:eagain c)) "WSAEWOULDBLOCK")
@@ -34,6 +38,8 @@
       (is (= 0xffff (:sol-socket c)))
       (is (= 0x1006 (:so-rcvtimeo c)))
       (is (= 0x1007 (:so-error c)))
+      (is (= 1 (:pollin c)))
+      (is (= 4 (:pollout c)))
       (is (= 4 (:eintr c)))
       (is (= 35 (:eagain c)))
       (is (= 54 (:econnreset c)))
@@ -43,6 +49,8 @@
       (is (= 1 (:sol-socket c)))
       (is (= 20 (:so-rcvtimeo c)))
       (is (= 4 (:so-error c)))
+      (is (= 1 (:pollin c)))
+      (is (= 4 (:pollout c)))
       (is (= 4 (:eintr c)))
       (is (= 11 (:eagain c)))
       (is (= 104 (:econnreset c)))

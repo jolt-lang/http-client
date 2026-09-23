@@ -51,11 +51,6 @@
 
 (defn- ensure-winsock! [] @winsock-ready)
 
-;; The socket library differs by name on Windows, not only by value, so the
-;; bindings that do live in the taken branch — recv/send take an int length and
-;; return int (not ssize_t); a socket is closed with closesocket; the fd flag is
-;; ioctlsocket, fixed-arity rather than variadic. jolt interns the vars from both
-;; branches at analysis time, so the references below resolve either way.
 (ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
 (ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int {:blocking true})
 (ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
@@ -138,9 +133,9 @@
 
 ;; The numbers that differ by platform. Windows is Winsock, which grew out of BSD
 ;; and kept its numbering where it could: SOL_SOCKET stays 0xffff,
-;; SO_RCVTIMEO/SO_ERROR keep their values, FIONREAD keeps the BSD _IOR encoding.
-;; Where it could not, it is neither BSD nor POSIX — there is no fcntl and no
-;; poll, and socket failures are reported as WSA codes, not errno. Answering any
+;; SO_RCVTIMEO/SO_ERROR keep their values. Where it could not, it is neither BSD
+;; nor POSIX — there is no fcntl and no poll(2), WSAPoll numbers its event bits
+;; its own way, and socket failures are reported as WSA codes, not errno. Answering any
 ;; of these with the POSIX value is silent misbehaviour, not a crash: a wrong
 ;; errno classifies a reset connection as a read timeout. So the map is data,
 ;; public and pinned by test/jolt/http/net_platform_test.clj the way the runtime
@@ -153,7 +148,8 @@
     {:sol-socket  0xffff
      :so-rcvtimeo 0x1006
      :so-error    0x1007
-     :fionread    0x4004667F   ; the BSD _IOR encoding, as on macOS
+     :pollin      0x0100       ; POLLRDNORM — WSAPoll's 0x1 is POLLERR
+     :pollout     0x0010       ; POLLWRNORM — WSAPoll's 0x4 is POLLNVAL
      :eintr       10004        ; WSAEINTR
      :eagain      10035        ; WSAEWOULDBLOCK
      :econnreset  10054        ; WSAECONNRESET
@@ -161,6 +157,8 @@
     {:sol-socket  (if macos? 0xffff 1)
      :so-rcvtimeo (if macos? 0x1006 20)
      :so-error    (if macos? 0x1007 4)
+     :pollin      1
+     :pollout     4
      :eintr       4
      :eagain      (if macos? 35 11)
      :econnreset  (if macos? 54 104)
@@ -170,21 +168,19 @@
 (def ^:private sol-socket (:sol-socket platform))
 (def ^:private so-rcvtimeo (:so-rcvtimeo platform))
 (def ^:private so-error    (:so-error platform))
-(def ^:private fionread    (:fionread platform))
+(def ^:private po-pollin   (:pollin platform))
+(def ^:private po-pollout  (:pollout platform))
 (def ^:private eintr       (:eintr platform))
 (def ^:private eagain      (:eagain platform))
 (def ^:private econnreset  (:econnreset platform))
 (def ^:private epipe       (:epipe platform))
 
 ;; fcntl F_GETFL/F_SETFL and O_NONBLOCK are POSIX-only — Windows flips blocking
-;; with ioctlsocket(FIONBIO). POLLIN/POLLOUT are poll(2)'s event bits; Winsock's
-;; WSAPoll takes the same two in its WSAPOLLFD.
+;; with ioctlsocket(FIONBIO).
 (def ^:private f-getfl 3)
 (def ^:private f-setfl 4)
 (def ^:private o-nonblock (if macos? 0x4 0x800))
 (def ^:private fionbio 0x8004667E)
-(def ^:private po-pollin 1)
-(def ^:private po-pollout 4)
 
 ;; Winsock has no poll(2): WSAPoll is its readiness call, over WSAPOLLFD — which
 ;; is NOT BSD's struct pollfd. SOCKET is a 64-bit pointer on x64, so the handle
