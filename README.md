@@ -45,6 +45,12 @@ require of ours could run.
 jolt binary links. The native libraries (libc sockets, OpenSSL) are declared in `deps.edn`
 under `:jolt/native`; jolt loads them before the namespaces are required.
 
+On Windows the sockets are Winsock, not libc: `jolt.http.net` loads `ws2_32` by
+name and runs `WSAStartup` on the first connect, and uses Winsock's constants and
+error codes (a WSA code, not errno) throughout. It does that itself rather than
+through the runtime's `jolt.winsock`, which shipped in jolt 0.8.11 — this library
+declares a lower floor and would fail to load there otherwise.
+
 ## Client options
 
 Everything `babashka.http-client`'s `client` accepts is honoured at send time,
