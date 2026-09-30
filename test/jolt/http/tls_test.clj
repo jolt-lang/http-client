@@ -128,3 +128,59 @@
     (println (str "tests=" (:test r) " pass=" (:pass r) " fail=" (:fail r) " error=" (:error r)))
     (when (or (pos? (:fail r)) (pos? (:error r)))
       (throw (ex-info "TLS failures" (select-keys r [:fail :error]))))))
+
+;; A TLS stream's :close tore down the socket and the SSL object every time it
+;; ran, so a second close — a finally after an error path already closed it —
+;; closed whatever fd number had been handed out since and freed the SSL twice.
+;; Server streams also never freed their per-connection SSL_CTX, and a failed
+;; server handshake leaked the SSL, the BIOs and the context.
+(defn- counting [f]
+  (let [closes (atom []) ssl-frees (atom 0) ctx-frees (atom 0)
+        close0 jolt.http.net/close ssl0 tls/c-SSL-free ctx0 tls/c-SSL-CTX-free]
+    (with-redefs [jolt.http.net/close (fn [fd] (swap! closes conj fd) (close0 fd))
+                  tls/c-SSL-free (fn [p] (swap! ssl-frees inc) (ssl0 p))
+                  tls/c-SSL-CTX-free (fn [p] (swap! ctx-frees inc) (ctx0 p))]
+      (f))
+    {:closes @closes :ssl-frees @ssl-frees :ctx-frees @ctx-frees}))
+
+(deftest closing-a-tls-stream-twice-releases-once
+  (let [st (tls/tls-connect "localhost" https-port true)
+        n (counting (fn [] ((jolt.host/ref-get st :close)) ((jolt.host/ref-get st :close))))]
+    (is (= 1 (count (:closes n))) "the socket is closed once")
+    (is (= 1 (:ssl-frees n)) "the SSL is freed once")
+    (is (= 0 (:ctx-frees n)) "a client context is shared out of the cache, never freed")))
+
+(deftest a-server-stream-frees-its-context
+  (let [fd (srv/listen-socket 18104)
+        server (future (tls/tls-wrap-server (srv/accept-raw fd) cert key-file))]
+    (try
+      (let [client (tls/tls-connect "localhost" 18104 true)
+            st @server
+            n (counting (fn [] ((jolt.host/ref-get st :close)) ((jolt.host/ref-get st :close))))]
+        ((jolt.host/ref-get client :close))
+        (is (= 1 (count (:closes n))))
+        (is (= 1 (:ssl-frees n)))
+        (is (= 1 (:ctx-frees n)) "the per-connection server context goes with it"))
+      (finally (jolt.http.net/close fd)))))
+
+(deftest a-failed-server-handshake-frees-everything
+  ;; with-redefs is global, so the client's own cleanup is counted too: its SSL
+  ;; is freed, its context is not (shared out of the cache). The accepted fd
+  ;; stays the caller's on failure, closed once by the caller below.
+  (let [fd (srv/listen-socket 18105)
+        raw (promise)
+        n (counting
+            (fn []
+              (let [server (future
+                             (let [r (srv/accept-raw fd)]
+                               (deliver raw r)
+                               (try (tls/tls-wrap-server r cert key-file)
+                                    (catch Throwable _ (jolt.http.net/close r)))))]
+                ;; the verifying client rejects the self-signed cert mid-handshake
+                (is (thrown? Exception (tls/tls-connect "localhost" 18105 false)))
+                @server)))]
+    (try
+      (is (= 1 (count (filter #{@raw} (:closes n)))) "the accepted socket is closed once")
+      (is (= 2 (:ssl-frees n)) "the server's SSL and the client's")
+      (is (= 1 (:ctx-frees n)) "the server's per-connection context")
+      (finally (jolt.http.net/close fd)))))

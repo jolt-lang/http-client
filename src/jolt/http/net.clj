@@ -52,7 +52,8 @@
 (defn- ensure-winsock! [] @winsock-ready)
 
 (ffi/defcfn c-socket      "socket"      [:int :int :int] :int)
-(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int {:blocking true})
+(ffi/defcfn c-connect     "connect"     [:int :pointer :int] :int
+  {:blocking true :capture-native-error true})
 (ffi/defcfn c-setsockopt  "setsockopt"  [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-getsockopt  "getsockopt"  [:int :int :int :pointer :pointer] :int)
 (ffi/defcfn c-getaddrinfo "getaddrinfo" [:pointer :pointer :pointer :pointer] :int :blocking)
@@ -153,7 +154,8 @@
      :eintr       10004        ; WSAEINTR
      :eagain      10035        ; WSAEWOULDBLOCK
      :econnreset  10054        ; WSAECONNRESET
-     :epipe       10053}       ; WSAECONNABORTED: Winsock's counterpart to EPIPE
+     :epipe       10053        ; WSAECONNABORTED: Winsock's counterpart to EPIPE
+     :econnrefused 10061}      ; WSAECONNREFUSED
     {:sol-socket  (if macos? 0xffff 1)
      :so-rcvtimeo (if macos? 0x1006 20)
      :so-error    (if macos? 0x1007 4)
@@ -162,7 +164,8 @@
      :eintr       4
      :eagain      (if macos? 35 11)
      :econnreset  (if macos? 54 104)
-     :epipe       32}))
+     :epipe       32
+     :econnrefused (if macos? 61 111)}))
 
 (def ^:private platform   (platform-consts macos? windows?))
 (def ^:private sol-socket (:sol-socket platform))
@@ -174,6 +177,7 @@
 (def ^:private eagain      (:eagain platform))
 (def ^:private econnreset  (:econnreset platform))
 (def ^:private epipe       (:epipe platform))
+(def ^:private econnrefused (:econnrefused platform))
 
 ;; fcntl F_GETFL/F_SETFL and O_NONBLOCK are POSIX-only — Windows flips blocking
 ;; with ioctlsocket(FIONBIO).
@@ -275,15 +279,37 @@
 ;; the fd and moves to the next one. connect() on a non-blocking socket returns
 ;; -1 (EINPROGRESS) instead of blocking; a readiness wait then says when to look
 ;; and SO_ERROR reports the outcome.
-(defn- timed-connect [fd addr addrlen timeout-ms]
-  (if (zero? (c-connect fd addr addrlen))
-    0
-    (let [[revents _] (poll-fd fd po-pollout timeout-ms)]
+(defn- await-connect
+  "Wait, at most until `deadline` (nil: no bound), for a connect in progress on
+  `fd` to finish. 0 when it connected, :timeout, or the connect's error code. A
+  signal cutting the wait short just waits again."
+  [fd deadline]
+  (loop []
+    (let [ms (if deadline (max 0 (- deadline (System/currentTimeMillis))) -1)
+          [revents err] (poll-fd fd po-pollout ms)]
       (cond
         ;; writable — the connect either completed or failed; SO_ERROR tells.
         (pos? revents) (socket-error fd)
         (zero? revents) :timeout
-        :else (conn-ex "java.io.IOException" "poll failed")))))
+        (= err eintr) (recur)
+        :else (conn-ex "java.io.IOException" (str "poll failed (code " err ")"))))))
+
+(defn- timed-connect [fd addr addrlen timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)
+        [r _] (c-connect fd addr addrlen)]
+    (if (zero? r) 0 (await-connect fd deadline))))
+
+(defn blocking-connect-outcome
+  "What a blocking connect came to: 0, or the error code that failed it.
+  `connect!` answers [result code]; `wait!` finishes a connect a signal
+  interrupted. EINTR does not fail the connect — it carries on in the
+  background (POSIX), so it is waited for rather than abandoned; abandoning it
+  moved on to the next address and reported a listening server as refusing."
+  [connect! wait! eintr]
+  (let [[r err] (connect!)]
+    (cond (zero? r) 0
+          (= err eintr) (wait!)
+          :else err)))
 
 (defn- attempt-connect [fd addr addrlen timeout-ms]
   (if (and timeout-ms (pos? timeout-ms))
@@ -295,7 +321,20 @@
           ;; the restore keeps a failing fcntl from masking the real error.
           (when (= 0 rc) (set-nonblock! fd false))
           rc))
-    (c-connect fd addr addrlen)))
+    (blocking-connect-outcome #(c-connect fd addr addrlen)
+                              #(await-connect fd nil)
+                              eintr)))
+
+(defn connect-failure-msg
+  "The message for a connect that no address answered. `err` is the last
+  attempt's outcome — :timeout, an error code, or nil when no socket could be
+  made. Only an actual refusal says \"refused\"; anything else names its code,
+  so a failure that is not the server's answer does not pass for one."
+  [host port err refused]
+  (cond (= :timeout err) (str "connect timed out: " host ":" port)
+        (= refused err) (str "connection refused: " host ":" port)
+        (nil? err) (str "connect failed: " host ":" port)
+        :else (str "connect failed (errno " err "): " host ":" port)))
 
 (defn connect
   "Resolve host:port and open a connected TCP socket; return its fd. `timeout-ms`,
@@ -334,12 +373,12 @@
              ;; and giving up on the host there would make :conn-timeout turn a
              ;; working request into a failing one. `timed-out?` only decides
              ;; which message the exhausted walk reports.
-             (loop [ai res timed-out? false]
+             (loop [ai res timed-out? false last-err nil]
                (if (ffi/null? ai)
                  (conn-ex "java.net.ConnectException"
-                          (if timed-out?
-                            (str "connect timed out: " host ":" port)
-                            (str "connection refused: " host ":" port)))
+                          (connect-failure-msg host port
+                                               (if timed-out? :timeout last-err)
+                                               econnrefused))
                  (let [fam     (ffi/read ai :int O-ai-family)
                        sockt   (ffi/read ai :int O-ai-socktype)
                        proto   (ffi/read ai :int O-ai-protocol)
@@ -347,7 +386,7 @@
                        addr    (ffi/read ai :pointer (ai-addr-offset ai))
                        fd      (c-socket fam sockt proto)]
                    (cond
-                     (neg? fd) (recur (ffi/read ai :pointer O-ai-next) timed-out?)
+                     (neg? fd) (recur (ffi/read ai :pointer O-ai-next) timed-out? last-err)
                      ;; The try covers the CONNECT and nothing else, so the retry
                      ;; below is an ordinary tail recur. It used to wrap the whole
                      ;; arm, which put the recur inside a try — a shape Clojure
@@ -367,7 +406,8 @@
                          fd
                          (do (c-close fd)
                              (recur (ffi/read ai :pointer O-ai-next)
-                                    (or timed-out? (= :timeout rc))))))))))
+                                    (or timed-out? (= :timeout rc))
+                                    rc))))))))
              (finally (c-freeaddrinfo res)))))
        (finally (ffi/free node) (ffi/free service) (ffi/free respp) (ffi/free hints))))))
 

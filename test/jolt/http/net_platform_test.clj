@@ -30,7 +30,8 @@
       (is (= 10004 (:eintr c)) "WSAEINTR")
       (is (= 10035 (:eagain c)) "WSAEWOULDBLOCK")
       (is (= 10054 (:econnreset c)) "WSAECONNRESET")
-      (is (= 10053 (:epipe c)) "WSAECONNABORTED"))))
+      (is (= 10053 (:epipe c)) "WSAECONNABORTED")
+      (is (= 10061 (:econnrefused c)) "WSAECONNREFUSED"))))
 
 (deftest posix-consts-are-unchanged
   (testing "macOS keeps its BSD numbers"
@@ -43,7 +44,8 @@
       (is (= 4 (:eintr c)))
       (is (= 35 (:eagain c)))
       (is (= 54 (:econnreset c)))
-      (is (= 32 (:epipe c)))))
+      (is (= 32 (:epipe c)))
+      (is (= 61 (:econnrefused c)))))
   (testing "Linux keeps its numbers"
     (let [c (net/platform-consts false false)]
       (is (= 1 (:sol-socket c)))
@@ -54,9 +56,32 @@
       (is (= 4 (:eintr c)))
       (is (= 11 (:eagain c)))
       (is (= 104 (:econnreset c)))
-      (is (= 32 (:epipe c))))))
+      (is (= 32 (:epipe c)))
+      (is (= 111 (:econnrefused c))))))
 
 (deftest winsock-is-bsd-shaped
   (is (= (:sol-socket (net/platform-consts true false))
          (:sol-socket (net/platform-consts false true)))
       "Windows sides with BSD on the socket level, as the runtime's own layer does"))
+
+;; A blocking connect() a signal interrupts returns EINTR, but the connection
+;; carries on in the background; POSIX says to wait for writability and read
+;; SO_ERROR, not to give the address up. Treating EINTR as a failed address
+;; walked on to the next one and reported "connection refused" for a server
+;; that was listening.
+(deftest an-interrupted-connect-is-finished-not-abandoned
+  (let [eintr (:eintr (net/platform-consts false false))]
+    (testing "EINTR waits for the connect to complete"
+      (is (= 0 (net/blocking-connect-outcome (fn [] [-1 eintr]) (fn [] 0) eintr))))
+    (testing "EINTR then a failed connect reports that failure"
+      (is (= 111 (net/blocking-connect-outcome (fn [] [-1 eintr]) (fn [] 111) eintr))))
+    (testing "any other error is the address failing"
+      (is (= 111 (net/blocking-connect-outcome (fn [] [-1 111]) (fn [] (throw (ex-info "no wait" {}))) eintr))))
+    (testing "success needs no wait"
+      (is (= 0 (net/blocking-connect-outcome (fn [] [0 0]) (fn [] (throw (ex-info "no wait" {}))) eintr))))))
+
+(deftest a-connect-failure-names-its-cause
+  (let [refused (:econnrefused (net/platform-consts false false))]
+    (is (= "connection refused: h:1" (net/connect-failure-msg "h" 1 refused refused)))
+    (is (= "connect failed (errno 101): h:1" (net/connect-failure-msg "h" 1 101 refused)))
+    (is (= "connect timed out: h:1" (net/connect-failure-msg "h" 1 :timeout refused)))))
