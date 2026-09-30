@@ -17,8 +17,16 @@
             [clj-http.lite.integration-test]))
 
 (defn -main [& _]
-  (let [r (t/run-tests)]
+  ;; Name the suites: a bare (t/run-tests) runs only *ns*, which here is not
+  ;; any of them, so the runner reported 0 tests and exited clean.
+  (let [r (t/run-tests 'jolt.http.deps-test
+                       'jolt.http.net-platform-test
+                       'jolt.http.stream-shim-test
+                       'jolt.http.core-test
+                       'clj-http.lite.links-test
+                       'clj-http.lite.client-test
+                       'clj-http.lite.integration-test)]
     (println (str "\n========== TOTAL =========="))
     (println (str "tests=" (:test r) " pass=" (:pass r) " fail=" (:fail r) " error=" (:error r)))
-    (when (or (pos? (:fail r)) (pos? (:error r)))
+    (when (or (zero? (:test r)) (pos? (:fail r)) (pos? (:error r)))
       (throw (ex-info "suite failures" (select-keys r [:fail :error]))))))
