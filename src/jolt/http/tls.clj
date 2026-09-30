@@ -181,8 +181,17 @@
           (throw (ssl-ex (str (ex-message e) " during TLS handshake")))
           (throw e))))))
 
-(defn- make-stream [sock ssl ctx rbio wbio]
-  (let [st (jolt.host/tagged-table :jolt/tls-stream)]
+(defn- release-ssl!
+  "Free a stream's SSL (and with it the BIOs SSL_set_bio handed over) and, for a
+  server stream, the per-connection context. Client contexts are shared out of
+  ctx-cache and outlive any one connection."
+  [ssl ctx owns-ctx?]
+  (try (c-SSL-free ssl) (catch Throwable _ nil))
+  (when owns-ctx? (try (c-SSL-CTX-free ctx) (catch Throwable _ nil))))
+
+(defn- make-stream [sock ssl ctx rbio wbio owns-ctx?]
+  (let [st (jolt.host/tagged-table :jolt/tls-stream)
+        closed? (atom false)]
     (jolt.host/ref-put! st :sock sock) (jolt.host/ref-put! st :ssl ssl)
     (jolt.host/ref-put! st :ctx ctx) (jolt.host/ref-put! st :rbio rbio)
     (jolt.host/ref-put! st :wbio wbio) (jolt.host/ref-put! st :eof false)
@@ -220,14 +229,14 @@
                         (= err WANT-WRITE) (do (flush-out self) (recur))
                         :else (do (jolt.host/ref-put! self :eof true) nil))))))
               (finally (ffi/free tmp)))))))
+    ;; Once only: a second close would close whatever fd number had been
+    ;; handed out since and free the SSL twice.
     (jolt.host/ref-put! st :close
       (fn [& _]
-        (try (c-SSL-shutdown ssl) (catch Throwable _ nil))
-        (try (net/close sock) (catch Throwable _ nil))
-        (try (c-SSL-free ssl) (catch Throwable _ nil))
-        ;; the SSL_CTX is NOT freed here: client contexts are shared out of
-        ;; ctx-cache and outlive any one connection. A server context is built
-        ;; per accept and freed by tls-wrap-server's own failure path.
+        (when (compare-and-set! closed? false true)
+          (try (c-SSL-shutdown ssl) (catch Throwable _ nil))
+          (try (net/close sock) (catch Throwable _ nil))
+          (release-ssl! ssl ctx owns-ctx?))
         nil))
     st))
 
@@ -329,7 +338,7 @@
 ;; (SSL_new takes a reference), so contexts are cached by exactly what
 ;; configures them: the verify mode and the caller's PKCS#12 material.
 ;;
-;; The cache owns every context it hands out, which is why make-stream's close
+;; The cache owns every context it hands out, which is why a client stream's close
 ;; frees the SSL but not the SSL_CTX. Nothing evicts: the number of distinct
 ;; TLS configurations in a process is the number of clients an app builds, not
 ;; a function of how many requests it makes.
@@ -365,7 +374,7 @@
     (c-SSL-set-connect ssl)
     (c-SSL-ctrl ssl SET-TLSEXT-HOSTNAME NAMETYPE-host-name host-buf)  ; SNI
     (when-not insecure? (c-SSL-set1-host ssl host-buf))
-    (let [st (make-stream sock ssl ctx rbio wbio)]
+    (let [st (make-stream sock ssl ctx rbio wbio false)]
       (try (handshake! st true)
            (catch Throwable e ((jolt.host/ref-get st :close)) (ffi/free host-buf) (throw e)))
       (ffi/free host-buf)
@@ -401,7 +410,9 @@
 
 (defn tls-wrap-server
   "Wrap an accepted plain socket fd `sock` as the server side of a TLS session,
-  using PEM `cert-file` and `key-file`. Returns a TLS stream."
+  using PEM `cert-file` and `key-file`. Returns a TLS stream, which owns `sock`
+  and its per-connection context from then on. On failure everything this
+  built is freed and `sock` is still the caller's to close."
   [sock cert-file key-file]
   (let [ctx (c-SSL-CTX-new (c-TLS-server-method))
         cf  (cstr cert-file)
@@ -411,6 +422,7 @@
         (throw (ssl-ex (str "cannot load cert " cert-file))))
       (when (zero? (c-SSL-CTX-use-key ctx kf FILETYPE-PEM))
         (throw (ssl-ex (str "cannot load key " key-file))))
+      (catch Throwable e (c-SSL-CTX-free ctx) (throw e))
       (finally (ffi/free cf) (ffi/free kf)))
     (let [ssl     (c-SSL-new ctx)
           memmeth (c-BIO-s-mem)
@@ -418,6 +430,7 @@
           wbio    (c-BIO-new memmeth)]
       (c-SSL-set-bio ssl rbio wbio)
       (c-SSL-set-accept ssl)
-      (let [st (make-stream sock ssl ctx rbio wbio)]
-        (handshake! st false)
+      (let [st (make-stream sock ssl ctx rbio wbio true)]
+        (try (handshake! st false)
+             (catch Throwable e (release-ssl! ssl ctx true) (throw e)))
         st))))
