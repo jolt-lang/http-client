@@ -21,5 +21,4 @@
   (let [r (t/run-tests 'jolt.http.timeout-test)]
     (println (str "\n========== TOTAL =========="))
     (println (str "tests=" (:test r) " pass=" (:pass r) " fail=" (:fail r) " error=" (:error r)))
-    (when (or (pos? (:fail r)) (pos? (:error r)))
-      (throw (ex-info "suite failures" (select-keys r [:fail :error]))))))
+    (System/exit (if (or (pos? (:fail r)) (pos? (:error r))) 1 0))))

@@ -28,5 +28,7 @@
                        'clj-http.lite.integration-test)]
     (println (str "\n========== TOTAL =========="))
     (println (str "tests=" (:test r) " pass=" (:pass r) " fail=" (:fail r) " error=" (:error r)))
-    (when (or (zero? (:test r)) (pos? (:fail r)) (pos? (:error r)))
-      (throw (ex-info "suite failures" (select-keys r [:fail :error]))))))
+    ;; Exit, as clojure test runners do: the test servers accept in futures that
+    ;; a closed listener does not wake on Linux, and jolt, like the JVM, waits for
+    ;; live non-daemon threads before the process ends.
+    (System/exit (if (or (zero? (:test r)) (pos? (:fail r)) (pos? (:error r))) 1 0))))

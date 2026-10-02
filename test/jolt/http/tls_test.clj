@@ -126,8 +126,7 @@
   (let [r (run-tests 'jolt.http.tls-test)]
     (println (str "\n========== TLS =========="))
     (println (str "tests=" (:test r) " pass=" (:pass r) " fail=" (:fail r) " error=" (:error r)))
-    (when (or (pos? (:fail r)) (pos? (:error r)))
-      (throw (ex-info "TLS failures" (select-keys r [:fail :error]))))))
+    (System/exit (if (or (pos? (:fail r)) (pos? (:error r))) 1 0))))
 
 ;; A TLS stream's :close tore down the socket and the SSL object every time it
 ;; ran, so a second close — a finally after an error path already closed it —
