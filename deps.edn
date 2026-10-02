@@ -9,7 +9,11 @@
  ;; gzip responses would fail to decode there; the floor says so up front.
  ;; (0.8.1 was the previous floor, for java.util.concurrent's executor and
  ;; future interfaces, which babashka.http-client's `->Executor` type-checks.)
- :jolt/min-version "0.8.9"
+ ;;
+ ;; 0.8.16 is where java.util.concurrent.CompletableFuture entered the runtime;
+ ;; the library stopped claiming it then, and that claim was what autoloaded
+ ;; jolt.http.jdk for a bare reference to the class on an older jolt.
+ :jolt/min-version "0.8.16"
 
  :paths ["src"]
 
@@ -41,7 +45,6 @@
                  "java.net.http.HttpResponse"
                  "java.net.http.HttpResponse$BodyHandlers"
                  "java.net.http.HttpHeaders"
-                 "java.util.concurrent.CompletableFuture"
                  "java.io.SequenceInputStream"
                  "java.net.Proxy"
                  "java.net.Proxy$Type"

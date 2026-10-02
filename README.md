@@ -35,7 +35,6 @@ require of ours could run.
 | --- | --- |
 | `java.net.URL`, `HttpURLConnection` | hand-rolled HTTP/1.1 over BSD sockets via `jolt.ffi` (`jolt.http.core` / `jolt.http.platform`) |
 | `java.net.http.HttpClient` (JDK 11+) | `jolt.http.jdk` — client/request/response builders, `BodyPublishers`/`BodyHandlers`, `HttpHeaders`, over the same transport |
-| `java.util.concurrent.CompletableFuture` | a real callback-driven future: `sendAsync` runs on jolt's future pool, `thenApply`/`exceptionally`/`thenCompose` chain off it, `@` derefs |
 | `java.net.http.WebSocket` | `jolt.http.websocket` — RFC 6455 client (handshake, frame codec, listener callbacks) |
 | `java.net.ProxySelector`, `Proxy`, `CookieManager`, `Authenticator` | real routing, not just constructors — see below |
 | `javax.net.ssl` (`SSLContext`, `SSLParameters`, trust managers, `KeyStore`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the socket (`jolt.http.tls`), including PKCS#12 key and trust stores |
@@ -165,7 +164,10 @@ leaves an arriving body alone.
 
 ## Requirements
 
-- jolt 0.8.9 or newer, declared as `:jolt/min-version`. 0.8.9 is where
+- jolt 0.8.16 or newer, declared as `:jolt/min-version`. 0.8.16 is where
+  `java.util.concurrent.CompletableFuture` entered the runtime; `sendAsync`
+  still returns this library's own future, and a bare `CompletableFuture`
+  reference gets jolt's class. 0.8.9 is where
   `java.util.zip` entered the runtime, on the zlib every jolt binary links;
   this library's gzip and deflate decoding runs on those classes and no
   longer ships a libz shim of its own. (The earlier floor, 0.8.1, was
