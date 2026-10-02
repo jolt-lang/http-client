@@ -1,10 +1,11 @@
 name: tests
 on: [push, pull_request]
 # One pinned jolt, not whatever the latest release happens to be. The supported
-# floor is 0.8.9, which deps.edn declares as :jolt/min-version: that is where
-# java.util.zip entered the runtime, on the zlib every jolt binary links, and
-# where this library stopped shipping gzip/deflate shims of its own over the
-# system libz. An older jolt has neither the classes nor the runtime's answer
+# floor is 0.8.16, which deps.edn declares as :jolt/min-version: that is where
+# java.util.concurrent.CompletableFuture entered the runtime and this library
+# stopped claiming it. 0.8.9 is where java.util.zip entered the runtime, on
+# the zlib every jolt binary links, and where this library stopped shipping
+# gzip/deflate shims of its own over the system libz. An older jolt has neither the classes nor the runtime's answer
 # for them, so a gzip response would fail to decode there; the floor refuses
 # the project instead. Earlier floors, for the record: 0.8.1 (java.util.concurrent's
 # executor interfaces, which babashka.http-client's ->Executor type-checks),
@@ -22,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        jolt: ['0.8.9']
+        jolt: ['0.8.16']
     name: test (jolt ${{ matrix.jolt }})
     env:
       JOLT_VERSION: ${{ matrix.jolt }}

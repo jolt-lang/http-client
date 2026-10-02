@@ -759,16 +759,6 @@
         ([scheme user host port path query fragment]
          (java.net.URI/create (assemble scheme (auth user host port) path query fragment))))))
 
-  ;; --- java.util.concurrent.CompletableFuture -------------------------------
-  ;; An unsettled future the caller completes later with complete() /
-  ;; completeExceptionally(); a deref before then parks.
-  (reg-ctor! (both "java.util.concurrent.CompletableFuture") (fn [& _] (cf-stage)))
-  (reg-statics! (both "java.util.concurrent.CompletableFuture")
-    {"completedFuture" (fn [v] (cf-done v))
-     "failedFuture"    (fn [t] (cf-failed t))
-     "supplyAsync"     (fn [s & _] (cf-async (fn [] (.get s))))
-     "runAsync"        (fn [r & _] (cf-async (fn [] (.run r) nil)))})
-
   ;; --- java.io.SequenceInputStream ------------------------------------------
   ;; Eager: the parts are drained and concatenated at construction. multipart
   ;; bodies are built this way and then read once, so nothing observes laziness —
