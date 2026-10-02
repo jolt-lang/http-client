@@ -644,5 +644,4 @@
   (let [r (run-tests 'jolt.http.babashka-test)]
     (println (str "\n========== babashka.http-client =========="))
     (println (str "tests=" (:test r) " pass=" (:pass r) " fail=" (:fail r) " error=" (:error r)))
-    (when (or (pos? (:fail r)) (pos? (:error r)))
-      (throw (ex-info "babashka.http-client compat failures" (select-keys r [:fail :error]))))))
+    (System/exit (if (or (pos? (:fail r)) (pos? (:error r))) 1 0))))

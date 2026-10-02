@@ -211,5 +211,4 @@
   (let [r (run-tests 'jolt.http.websocket-test)]
     (println (str "\n========== websocket =========="))
     (println (str "tests=" (:test r) " pass=" (:pass r) " fail=" (:fail r) " error=" (:error r)))
-    (when (or (pos? (:fail r)) (pos? (:error r)))
-      (throw (ex-info "websocket failures" (select-keys r [:fail :error]))))))
+    (System/exit (if (or (pos? (:fail r)) (pos? (:error r))) 1 0))))
