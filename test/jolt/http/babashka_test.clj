@@ -563,6 +563,28 @@
         (Thread/sleep 150)
         (is (= "hello" (pulled resp)))))))
 
+(deftest a-deadline-names-the-bound-that-fired
+  ;; The header read's deadline is the sooner of the caller's and the
+  ;; set-max-response-ms! cap. The message named the cap whenever one was set,
+  ;; so a request timeout under a longer cap read as the cap, and jdk's
+  ;; request-timeout-ex left it a SocketTimeoutException.
+  (let [dripping (fn [] (let [st (scripted-stream (repeat 50 "H"))
+                              rd (core/tget st :read)]
+                          (core/tput! st :read (fn [& a] (Thread/sleep 30) (apply rd a)))
+                          st))
+        msg (fn [deadline]
+              (try (core/read-response (dripping) deadline) nil
+                   (catch java.net.SocketTimeoutException e (ex-message e))))]
+    (try
+      (core/set-max-response-ms! 60000)
+      (is (= "Response exceeded the request timeout"
+             (msg (+ (System/currentTimeMillis) 50))))
+      (core/set-max-response-ms! 50)
+      (is (= "Response exceeded the total time limit of 50ms"
+             (msg (+ (System/currentTimeMillis) 60000))))
+      (is (= "Response exceeded the total time limit of 50ms" (msg nil)))
+      (finally (core/set-max-response-ms! nil)))))
+
 (deftest chunked-trailers-are-consumed
   (testing "a trailer that arrives after the terminal chunk is taken off the wire"
     ;; A connection is reusable after a chunked body, so anything left of this
