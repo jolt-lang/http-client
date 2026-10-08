@@ -111,6 +111,18 @@
 (ffi/defcfn c-SSL-CTX-use-key-evp   "SSL_CTX_use_PrivateKey"  [:pointer :pointer] :int)
 (ffi/defcfn c-SSL-CTX-cert-store "SSL_CTX_get_cert_store" [:pointer] :pointer)
 (ffi/defcfn c-X509-STORE-add-cert "X509_STORE_add_cert" [:pointer :pointer] :int)
+;; Bound lazily like every defcfn, so an OpenSSL without them only fails if
+;; they are called, and they are only called on Windows.
+(ffi/defcfn c-SSL-CTX-load-verify-store "SSL_CTX_load_verify_store" [:pointer :pointer] :int)
+(ffi/defcfn c-ERR-clear-error   "ERR_clear_error"   [] :void)
+(ffi/defcfn c-ERR-peek-error    "ERR_peek_error"    [] :long)
+(ffi/defcfn c-ERR-get-error     "ERR_get_error"     [] :long)
+(ffi/defcfn c-ERR-error-string-n "ERR_error_string_n" [:long :pointer :size_t] :void)
+(ffi/defcfn c-SSL-get-verify-result "SSL_get_verify_result" [:pointer] :long)
+(ffi/defcfn c-X509-verify-cert-error-string "X509_verify_cert_error_string" [:long] :string)
+
+(def windows?
+  (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "windows"))
 
 (defn- ssl-ex
   "A typed SSLException carrying a real message. Built through
@@ -150,6 +162,27 @@
         true)
       false)))
 
+;; Why a handshake failed, from what OpenSSL recorded. SSL_get_error is 1 for
+;; every failure inside OpenSSL, so on its own a missing CA store reads the
+;; same as a broken peer. The verify result names a refused certificate, and
+;; the error queue the rest; draining the queue also keeps it from leaking
+;; into the next call on this thread.
+(defn- handshake-failure [ssl err]
+  (let [v (c-SSL-get-verify-result ssl)
+        reason (loop [first-reason nil]
+                 (let [code (c-ERR-get-error)]
+                   (if (zero? code)
+                     first-reason
+                     (recur (or first-reason
+                                (let [buf (ffi/alloc 256)]
+                                  (try (c-ERR-error-string-n code buf 256)
+                                       (ffi/ptr->string buf)
+                                       (finally (ffi/free buf)))))))))]
+    (str "TLS handshake failed"
+         (cond (not (zero? v)) (str ": certificate verify failed: " (c-X509-verify-cert-error-string v))
+               reason (str ": " reason)
+               :else (str " (SSL_get_error=" err ")")))))
+
 (defn- handshake! [st connect?]
   ;; A transport failure inside the handshake (reset, timeout, EOF from
   ;; feed-in/flush-out) surfaces as SSLException — the way javax.net.ssl wraps
@@ -171,7 +204,7 @@
                                               (throw (ssl-ex "connection closed during TLS handshake")))
                                             (recur))
                       (= err WANT-WRITE) (recur)
-                      :else (throw (ssl-ex (str "TLS handshake failed (SSL_get_error=" err ")")))))))))]
+                      :else (throw (ssl-ex (handshake-failure (jolt.host/ref-get st :ssl) err)))))))))]
     (try
       (drive!)
       (catch Throwable e
@@ -313,7 +346,24 @@
       (doseq [c (cons cert cas) :when c] (c-X509-STORE-add-cert store c))
       (finally (free)))))
 
-(defn- build-client-ctx
+;; SSL_CTX_set_default_verify_paths reads the CA bundle from OPENSSLDIR, a path
+;; fixed when OpenSSL was built. On Windows that is the build machine's, like
+;; MSYS2's /ucrt64/etc/ssl, so on any other machine there are no CAs and every
+;; handshake fails verification. The system's own store is where Windows keeps
+;; them, and OpenSSL 3.2+ reads it through the org.openssl.winstore: URI. It
+;; also carries the roots an admin or an antivirus installed, which a bundle
+;; would not. A failed load leaves errors on the thread's queue, which
+;; SSL_get_error reads, so they are cleared either way.
+(defn- load-platform-cas! [ctx]
+  (c-SSL-CTX-default-verify ctx)
+  (when windows?
+    (let [uri (cstr "org.openssl.winstore:")]
+      (try (c-SSL-CTX-load-verify-store ctx uri)
+           (catch Throwable _ nil)
+           (finally (ffi/free uri))))
+    (c-ERR-clear-error)))
+
+(defn build-client-ctx
   "A client SSL_CTX configured for `insecure?` and the caller's stores. A trust
   store REPLACES the platform CA set, the way a TrustManagerFactory over a
   truststore does on the JVM."
@@ -326,7 +376,7 @@
         (c-SSL-CTX-set-verify ctx VERIFY-NONE ffi/null)
         (do (if trust-store
               (apply-trust-store! ctx trust-store)
-              (c-SSL-CTX-default-verify ctx))
+              (load-platform-cas! ctx))
             (c-SSL-CTX-set-verify ctx VERIFY-PEER ffi/null)))
       ctx
       (catch Throwable e (c-SSL-CTX-free ctx) (throw e)))))
