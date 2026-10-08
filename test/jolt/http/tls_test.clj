@@ -41,6 +41,16 @@
 (deftest self-signed-is-refused-by-default
   (is (thrown? Exception (http/get (str base "/200")))))
 
+(deftest a-refused-certificate-says-why
+  ;; SSL_get_error only says the handshake failed in OpenSSL, which reads the
+  ;; same for a missing CA store as for a broken peer. The verify result names
+  ;; the certificate problem.
+  (let [e (try (tls/tls-connect "localhost" https-port false) nil
+               (catch Throwable e e))]
+    (is (some? e))
+    (is (re-find #"certificate verify failed: self[- ]signed certificate" (str (ex-message e)))
+        (pr-str (ex-message e)))))
+
 (deftest insecure-ssl-context-accepts-it
   (let [c (http/client {:ssl-context {:insecure true}})
         r (http/get (str base "/200") {:client c})]

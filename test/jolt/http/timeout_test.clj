@@ -106,6 +106,18 @@
     (is (some? crypto) "libcrypto must be loaded by jolt.http.tls itself")
     (is (some? ssl) "libssl must be loaded by jolt.http.tls itself")))
 
+(deftest windows-store-load-leaves-no-error-behind
+  ;; On Windows the platform CAs come from the system store, not from the
+  ;; build's OPENSSLDIR, which only exists where that OpenSSL was built. Forced
+  ;; on here, the store URI fails to open, and that failure must not stay on
+  ;; the thread's error queue: SSL_get_error reads it, and the next handshake
+  ;; would report SSL_ERROR_SSL however well it went.
+  (with-redefs [tls/windows? true]
+    (let [ctx (tls/build-client-ctx false nil)]
+      (is (some? ctx))
+      (is (zero? (tls/c-ERR-peek-error)) "the store load's errors are cleared")
+      (tls/c-SSL-CTX-free ctx))))
+
 ;; --- a peer that trickles rather than stalls --------------------------------
 ;; SO_RCVTIMEO bounds inactivity, not total duration, so a peer sending one byte
 ;; every few seconds resets the read timer forever and the request never
