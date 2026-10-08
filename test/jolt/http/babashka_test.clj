@@ -203,7 +203,12 @@
   (let [c (http/client {:connect-timeout 2000})]
     (is (= 200 (:status (http/get (str base "/200") {:client c})))))
   (testing "a request timeout actually bounds a slow response"
-    (is (thrown? Exception (http/get (str base "/slow") {:timeout 300})))))
+    ;; and reads as java.net.http's HttpTimeoutException, which is what callers
+    ;; classify a timeout by, not the socket's read timeout underneath it
+    (let [e (try (http/get (str base "/slow") {:timeout 300}) nil
+                 (catch Exception e e))]
+      (is (instance? java.net.http.HttpTimeoutException e) (pr-str (class e)))
+      (is (= "request timed out" (ex-message e))))))
 
 (deftest authenticator-answers-a-401
   (let [c (http/client {:authenticator {:user "username" :pass "password"}})
