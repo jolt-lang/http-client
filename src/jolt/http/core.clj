@@ -399,20 +399,22 @@
   (reset! max-response-ms ms))
 
 (defn- effective-deadline
-  "The absolute millisecond deadline in force: the caller's, the process-wide
-  cap, or whichever of the two comes first."
+  "The deadline in force, as {:at ms :cap cap-ms}: the caller's, the process-wide
+  cap, or whichever of the two comes first. :cap is set only when the cap is the
+  one in force, so check-deadline! can name the bound that fired."
   [deadline]
   (let [cap @max-response-ms
         cap-deadline (when (and cap (pos? cap)) (+ (System/currentTimeMillis) cap))]
-    (cond (and deadline cap-deadline) (min deadline cap-deadline)
-          :else (or deadline cap-deadline))))
+    (cond (and cap-deadline (or (nil? deadline) (< cap-deadline deadline)))
+          {:at cap-deadline :cap cap}
+          deadline {:at deadline})))
 
-(defn- check-deadline! [deadline]
-  (when (and deadline (> (System/currentTimeMillis) deadline))
+(defn- check-deadline! [{:keys [at cap]}]
+  (when (and at (> (System/currentTimeMillis) at))
     ;; Thrown, so perform!'s finally closes the stream. That is what stops a
     ;; trickling peer leaking a socket and a parked thread per attempt.
     (throw-typed "java.net.SocketTimeoutException"
-                 (if-let [cap @max-response-ms]
+                 (if cap
                    (str "Response exceeded the total time limit of " cap "ms")
                    "Response exceeded the request timeout"))))
 

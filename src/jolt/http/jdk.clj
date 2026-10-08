@@ -624,6 +624,19 @@
   [pairs]
   (reduce (fn [m [k v]] (update m (str/lower-case k) (fnil conj []) v)) {} pairs))
 
+;; java.net.http reports a request that outlived HttpRequest.timeout as an
+;; HttpTimeoutException "request timed out", however the wait ended: callers
+;; match on that class, or on babashka.http-client's "timed out" wording. Ours
+;; ends as the socket's read timeout or the deadline check in the header read,
+;; both SocketTimeoutException. Only the request timeout is renamed; the
+;; process-wide cap from core/set-max-response-ms! keeps its own message.
+(defn- request-timeout-ex [t req-timeout]
+  (if (and req-timeout
+           (instance? java.net.SocketTimeoutException t)
+           (not (str/starts-with? (str (ex-message t)) "Response exceeded the total time limit")))
+    (jolt.host/throwable "java.net.http.HttpTimeoutException" "request timed out")
+    t))
+
 (defn- net-http-send
   "Run a java.net.http request over the socket/TLS transport: proxy selection,
   cookies, redirects, authentication, then hand the body to the BodyHandler."
@@ -651,7 +664,8 @@
            retried-auth? false]
       (let [prx (select-proxy selector uri)
             hdrs (request-headers (or (tget request :headers) []) uri cookie-handler auth-header)
-             resp (exchange {:url url :method method :headers hdrs :body body
+            resp (try
+                  (exchange {:url url :method method :headers hdrs :body body
                              :read-timeout req-timeout :conn-timeout conn-timeout
                              :insecure? insecure? :proxy prx :ssl ssl :deadline deadline
                              ;; Only ofInputStream wants a live body; every other
@@ -661,6 +675,7 @@
                              ;; response headers arrive; the body is bounded only
                              ;; by set-max-response-ms! and the caller (#26).
                              :body-unbounded? (boolean req-timeout)})
+                  (catch Throwable t (throw (request-timeout-ex t req-timeout))))
             pairs (:header-pairs resp)]
         (when cookie-handler
           (cookie-manager-put! cookie-handler uri (headers->map pairs)))
