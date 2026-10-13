@@ -275,6 +275,19 @@
       (is (= "bye" (:body (get! "/close"))))
       (is (zero? (core/pool-count)))))))
 
+(deftest a-body-closed-before-its-end-gives-up-the-connection
+  (with-pool-server
+   (fn [_s]
+    (let [conn (.openConnection (java.net.URL. (str *pool-base* "/chunked")))
+          body (.getInputStream conn)]
+      (is (= 200 (.getResponseCode conn)))
+      (is (pos? (.read body (byte-array 3) 0 3)))
+      (.close body)
+      (is (zero? (core/pool-count))
+          "the rest of that response is still on the socket, so it is not pooled"))
+    (is (= "ok /next" (:body (get! "/next"))))
+    (is (= 1 (core/pool-count))))))
+
 (defn- hangup-handler
   "Answers the first request on a connection and hangs up on the next one
   without replying — a peer retiring a socket exactly as the client reuses it,
@@ -382,7 +395,10 @@
       (testing "a first request with a generous timeout leaves a pooled connection"
         (let [c (.openConnection (java.net.URL. (str "http://localhost:" (:port slow) "/fast")))]
           (.setReadTimeout c 10000)
-          (is (= 200 (.getResponseCode c))))
+          (is (= 200 (.getResponseCode c)))
+          ;; the body is read off the wire as the caller reads it, so the
+          ;; connection goes back to the pool when it has been read to its end
+          (is (= "ok" (slurp (.getInputStream c)))))
         (is (= 1 (core/pool-count))))
       (testing "the next request's own, shorter timeout is the one that applies"
         (let [c (.openConnection (java.net.URL. (str "http://localhost:" (:port slow) "/slow")))]
