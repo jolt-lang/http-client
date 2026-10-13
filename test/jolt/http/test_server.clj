@@ -15,6 +15,10 @@
 (ffi/defcfn c-listen     "listen"     [:int :int] :int)
 (ffi/defcfn c-setsockopt "setsockopt" [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn c-shutdown   "shutdown"   [:int :int] :int)
+
+;; SHUT_RDWR is 2 on every platform this runs on
+(def ^:private SHUT-RDWR 2)
 
 (def ^:private AF-INET 2)
 (def ^:private SOCK-STREAM 1)
@@ -267,8 +271,7 @@
                           (if (:close resp)
                             (swap! stats update :per-connection conj (inc n))
                             (recur (subs acc (+ he 4 (:content-length req))) (inc n)))))))))))))
-    (catch Throwable _ nil)
-    (finally (try (conn-close conn) (catch Throwable _ nil)))))
+    (catch Throwable _ nil)))
 
 (defn start-persistent
   "A server that keeps connections open. :stats holds {:requests n
@@ -277,11 +280,17 @@
   :chunked true to frame the body with Transfer-Encoding, or :close true to ask
   the client to hang up.
 
-  Accepted connections are tracked in :conns and closed by `stop`. Closing only
+  Accepted connections are tracked in :conns and shut down by `stop`. Closing only
   the listening socket is not enough for a server whose whole point is that
   connections outlive a request: Linux refuses to rebind the port while they are
   still established, even with SO_REUSEADDR, so the next server on that port
-  failed with \"bind() failed\"."
+  failed with \"bind() failed\".
+
+  Each connection is CLOSED only by the thread serving it, and only after it is
+  out of :conns; `stop` shuts the live ones down, which wakes that thread.
+  Closing from `stop` as well closed every fd twice, and the second close landed
+  on whatever socket had been given that number in between — a client
+  connection in the next test, which then read EBADF or another socket's bytes."
   [port handler]
   (let [fd (listen-socket port)
         running? (atom true)
@@ -295,7 +304,10 @@
             (neg? raw) (when @running? (recur))
             :else (do (swap! conns conj raw)
                       (future (try (persistent-serve raw handler stats running?)
-                                   (finally (swap! conns disj raw))))
+                                   (finally
+                                     (locking conns
+                                       (swap! conns disj raw)
+                                       (try (net/close raw) (catch Throwable _ nil))))))
                       (recur))))))
     {:fd fd :port port :running running? :stats stats :conns conns}))
 
@@ -331,20 +343,27 @@
                           (or handler default-handler) concurrent?))
      {:fd fd :port port :running running?})))
 
+(defn- shutdown-conns!
+  "Shut down every connection a persistent server is still serving. Not close:
+  the serving thread closes its own fd once it sees the EOF (see
+  start-persistent), so each fd is closed exactly once."
+  [server]
+  (when-let [a (:conns server)]
+    (locking a
+      (doseq [c @a] (try (c-shutdown c SHUT-RDWR) (catch Throwable _ nil))))))
+
 (defn drop-connections!
-  "Close every accepted connection, leaving the listener up — a peer retiring
+  "Hang up every accepted connection, leaving the listener up — a peer retiring
   its idle keep-alive sockets."
   [server]
-  (doseq [c (when-let [a (:conns server)] @a)]
-    (try (net/close c) (catch Throwable _ nil)))
+  (shutdown-conns! server)
   nil)
 
 (defn stop [server]
   (reset! (:running server) false)
   ;; accepted connections first: a persistent server's outlive the request that
   ;; made them, and the port cannot be rebound while they are established
-  (doseq [c (when-let [a (:conns server)] @a)]
-    (try (net/close c) (catch Throwable _ nil)))
+  (shutdown-conns! server)
   (net/close (:fd server))
   nil)
 

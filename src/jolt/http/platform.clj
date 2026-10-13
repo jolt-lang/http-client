@@ -55,6 +55,33 @@
   (core/set-max-response-ms! ms))
 
 
+;; The body is left on the wire. getResponseCode and the header getters only
+;; need the head, and clj-http-lite reaches the body through getInputStream /
+;; getErrorStream alone, so the call can come back at the headers and the body
+;; can be read as it arrives: `:as :stream` over an SSE feed or an LLM token
+;; stream used to wait for the whole response before returning anything. The
+;; buffered coercions lose nothing — clj-http-lite drains the stream to EOF
+;; itself, and gzip/deflate are decoded from those bytes afterwards.
+;;
+;; Unlike the java.net.http path, the socket's read timeout stays armed for the
+;; body (read-response's body-unbounded? is false here): on HttpURLConnection
+;; setReadTimeout is SO_RCVTIMEO and bounds every read of the body, which is
+;; what lets an SSE reader bound the gap between events. set-max-response-ms!
+;; still caps the body's total time.
+;;
+;; Where the runtime cannot carry a live body (jolt below 0.8.8, see
+;; core/reify-input-streams?) read-response hands back a buffered body and
+;; nothing here changes.
+
+(defn- discard-body!
+  "Drain and let go of a streamed body nobody will read — the response to a
+  redirect being followed. Left alone, its connection stays open until GC and
+  could never go back to the pool."
+  [resp]
+  (when-let [pull (:body-pull resp)]
+    ((:release! resp) (try (loop [] (if (nil? (pull)) true (recur)))
+                           (catch Throwable _ false)))))
+
 (defn- perform! [conn]
   (loop [url (tget conn :url)
          method (tget conn :method)
@@ -66,17 +93,30 @@
           open! (fn [] (connect-stream (tget url :host) (effective-port url) https?
                                        (tget conn :insecure) (tget conn :read-timeout)
                                        (tget conn :connect-timeout)))
+          ;; A buffered response is done with its connection here: pooled when
+          ;; the response says it may be kept, closed otherwise, including on
+          ;; the way out of a failure. A streamed one still has its body on the
+          ;; socket, so ownership passes to the body stream through :release!,
+          ;; which takes true once the body was read to its end.
           once (fn [stream received]
-                 (let [ok (atom false)]
+                 (let [ok (atom false)
+                       streaming (atom false)]
                    (try
                      (s-write stream (build-request method url (tget conn :req-headers) body))
-                     (let [r (read-response stream nil method received)]
-                       (reset! ok (:reusable? r))
-                       r)
+                     (let [r (read-response stream nil method received true)]
+                       (if (:body-pull r)
+                         (do (reset! streaming true)
+                             (assoc r :release!
+                                    (fn [complete?]
+                                      (if (and complete? (:reusable? r))
+                                        (core/pool-release! key stream)
+                                        (try (s-close stream) (catch Throwable _ nil))))))
+                         (do (reset! ok (:reusable? r)) r)))
                      (finally
-                       (if @ok
-                         (core/pool-release! key stream)
-                         (try (s-close stream) (catch Throwable _ nil)))))))
+                       (when-not @streaming
+                         (if @ok
+                           (core/pool-release! key stream)
+                           (try (s-close stream) (catch Throwable _ nil))))))))
           resp (if-let [pooled (core/pool-acquire key)]
                  ;; a connection the peer retired since the last request fails
                  ;; before answering — cleanly or with a reset, depending on the
@@ -94,14 +134,34 @@
                (redirect-statuses (:status resp))
                (or (= method "GET") (= method "HEAD"))
                loc (< redirects 20))
-        (recur (resolve-location url loc)
+        (do (discard-body! resp)
+            (recur (resolve-location url loc)
                (if (= (:status resp) 303) "GET" method)
-               (inc redirects))
+               (inc redirects)))
         (do (tput! conn :response resp) (tput! conn :performed true) resp)))))
 
 (defn- ensure-performed! [conn]
   (when-not (tget conn :performed) (perform! conn))
   (tget conn :response))
+
+(defn- body-stream
+  "The response body as an InputStream: live when the transport left it on the
+  wire, over the bytes otherwise. Made once, so getInputStream, getErrorStream
+  and disconnect all see the same stream."
+  [conn]
+  (or (tget conn :body-stream)
+      (let [resp (ensure-performed! conn)
+            s (if-let [pull (:body-pull resp)]
+                (core/make-body-stream pull (:release! resp))
+                (make-bais (:body resp)))]
+        (tput! conn :body-stream s)
+        s)))
+
+(defn- input-stream [conn]
+  (let [resp (ensure-performed! conn)]
+    (if (>= (:status resp) 400)
+      (throw-typed "java.io.IOException" (str "Server returned HTTP response code: " (:status resp)))
+      (body-stream conn))))
 
 (defn- open-connection [url]
   (let [c (tt :jolt/http-url-connection)]
@@ -112,6 +172,7 @@
     (tput! c :read-timeout nil) (tput! c :connect-timeout nil)
     (tput! c :insecure false) (tput! c :out-buffer nil)
     (tput! c :performed false) (tput! c :response nil)
+    (tput! c :body-stream nil)
     c))
 
 ;; --- install ---------------------------------------------------------------
@@ -239,7 +300,9 @@
      "toString" (fn [self] (tget self :spec))
      "toExternalForm" (fn [self] (tget self :spec))
      "openConnection" (fn [self] (open-connection self))
-     "openStream" (fn [self] (make-bais (:body (ensure-performed! (open-connection self)))))})
+     ;; openConnection().getInputStream(), as on the JVM: an error status
+     ;; throws rather than handing back the error page as if it were the body.
+     "openStream" (fn [self] (input-stream (open-connection self)))})
 
   ;; java.net.HttpURLConnection
   (__register-class-methods! :jolt/http-url-connection
@@ -268,7 +331,13 @@
      "setChunkedStreamingMode" (fn [self _n] nil)
      "setFixedLengthStreamingMode" (fn [self _n] nil)
      "connect" (fn [self] nil)
-     "disconnect" (fn [self] nil)
+     ;; Gives up a body still on the wire: its connection is closed rather
+     ;; than pooled, since what is left of the response is unread.
+     "disconnect" (fn [self]
+                    (when (tget self :performed)
+                      (try (.close ^java.io.InputStream (body-stream self))
+                           (catch Throwable _ nil)))
+                    nil)
      "getOutputStream" (fn [self]
                          (when (nil? (tget self :out-buffer)) (tput! self :out-buffer (make-baos)))
                          (tget self :out-buffer))
@@ -280,14 +349,10 @@
      "getHeaderField" (fn [self i]
                         (let [pairs (:header-pairs (ensure-performed! self))]
                           (when (and (>= i 1) (<= i (count pairs))) (second (nth pairs (dec i))))))
-     "getInputStream" (fn [self]
-                        (let [resp (ensure-performed! self)]
-                          (if (>= (:status resp) 400)
-                            (throw-typed "java.io.IOException" (str "Server returned HTTP response code: " (:status resp)))
-                            (make-bais (:body resp)))))
+     "getInputStream" (fn [self] (input-stream self))
      "getErrorStream" (fn [self]
-                        (let [resp (ensure-performed! self)]
-                          (when (>= (:status resp) 400) (make-bais (:body resp)))))
+                        (when (>= (:status (ensure-performed! self)) 400)
+                          (body-stream self)))
      "getContentLength" (fn [self]
                           (or (parse-long (or (header-ci (:header-pairs (ensure-performed! self)) "content-length") "")) -1))
      "setHostnameVerifier" (fn [self v] (tput! self :hostname-verifier v) nil)

@@ -143,18 +143,28 @@
 ;; closed whatever fd number had been handed out since and freed the SSL twice.
 ;; Server streams also never freed their per-connection SSL_CTX, and a failed
 ;; server handshake leaked the SSL, the BIOs and the context.
-(defn- counting [f]
-  (let [closes (atom []) ssl-frees (atom 0) ctx-frees (atom 0)
-        close0 jolt.http.net/close ssl0 tls/c-SSL-free ctx0 tls/c-SSL-CTX-free]
-    (with-redefs [jolt.http.net/close (fn [fd] (swap! closes conj fd) (close0 fd))
-                  tls/c-SSL-free (fn [p] (swap! ssl-frees inc) (ssl0 p))
-                  tls/c-SSL-CTX-free (fn [p] (swap! ctx-frees inc) (ctx0 p))]
-      (f))
-    {:closes @closes :ssl-frees @ssl-frees :ctx-frees @ctx-frees}))
+(defn- counting
+  "Runs `f` and counts socket closes and SSL / SSL_CTX frees. Given `st`, only
+  that stream's own socket, SSL and context count: with-redefs is global, and
+  the in-process test server closes and frees ITS end of the same connection
+  on its own thread, inside this window on Linux, which counted as a second
+  close (nightly CI). Without `st`, every call counts."
+  ([f] (counting nil f))
+  ([st f]
+   (let [closes (atom []) ssls (atom []) ctxs (atom [])
+         close0 jolt.http.net/close ssl0 tls/c-SSL-free ctx0 tls/c-SSL-CTX-free
+         own (fn [k] (if st (let [v (jolt.host/ref-get st k)] #(= v %)) (constantly true)))]
+     (with-redefs [jolt.http.net/close (fn [fd] (swap! closes conj fd) (close0 fd))
+                   tls/c-SSL-free (fn [p] (swap! ssls conj p) (ssl0 p))
+                   tls/c-SSL-CTX-free (fn [p] (swap! ctxs conj p) (ctx0 p))]
+       (f))
+     {:closes (filterv (own :sock) @closes)
+      :ssl-frees (count (filter (own :ssl) @ssls))
+      :ctx-frees (count (filter (own :ctx) @ctxs))})))
 
 (deftest closing-a-tls-stream-twice-releases-once
   (let [st (tls/tls-connect "localhost" https-port true)
-        n (counting (fn [] ((jolt.host/ref-get st :close)) ((jolt.host/ref-get st :close))))]
+        n (counting st (fn [] ((jolt.host/ref-get st :close)) ((jolt.host/ref-get st :close))))]
     (is (= 1 (count (:closes n))) "the socket is closed once")
     (is (= 1 (:ssl-frees n)) "the SSL is freed once")
     (is (= 0 (:ctx-frees n)) "a client context is shared out of the cache, never freed")))
@@ -165,7 +175,7 @@
     (try
       (let [client (tls/tls-connect "localhost" 18104 true)
             st @server
-            n (counting (fn [] ((jolt.host/ref-get st :close)) ((jolt.host/ref-get st :close))))]
+            n (counting st (fn [] ((jolt.host/ref-get st :close)) ((jolt.host/ref-get st :close))))]
         ((jolt.host/ref-get client :close))
         (is (= 1 (count (:closes n))))
         (is (= 1 (:ssl-frees n)))

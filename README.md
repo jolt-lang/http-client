@@ -80,7 +80,8 @@ send runs on jolt's own future pool. Each is recorded on the client and read
 back, so a caller that sets and inspects one sees what it set. WebSocket
 negotiates no extensions, so no `permessage-deflate`.
 
-`:as :stream` (`BodyHandlers/ofInputStream`) is live **on jolt 0.8.8 and up**:
+`:as :stream` is live on both clients — `BodyHandlers/ofInputStream` on
+`babashka.http-client`, `HttpURLConnection.getInputStream` under `clj-http-lite`:
 the response comes back as soon as the headers are in and the body is pulled off the socket as it is read,
 so an SSE feed, an LLM token stream or a log tail works. The stream is framed by
 the response — `Content-Length`, chunked, or the peer's close — so it ends where
@@ -96,10 +97,12 @@ rather than being cut (#26). For a hard total cap,
 streamed or not.
 
 The live stream is a reify `java.io.InputStream`, which needs the abstract-class
-method inheritance jolt gained in 0.8.8. Below that — the declared floor is
-0.8.1 — the transport probes for one, does not find it, and keeps reading bodies
-to completion, so `:as :stream` is a stream over a finished body as it was
-before. CI runs both.
+method inheritance jolt gained in 0.8.8. The declared floor is above that now,
+but the transport still probes for one, and on a jolt without it keeps reading
+bodies to completion, so `:as :stream` is a stream over a finished body.
+
+`clj-http-lite` reads every other `:as` by draining that same stream, so its
+buffered coercions, gzip/deflate decoding included, are unchanged.
 
 Two things to know. The connection belongs to the stream until the body is read
 to its end or the stream is closed, so a caller that abandons a stream should
