@@ -1,21 +1,20 @@
 name: tests
 on: [push, pull_request]
-# One pinned jolt, not whatever the latest release happens to be. The supported
-# floor is 0.8.16, which deps.edn declares as :jolt/min-version: that is where
-# java.util.concurrent.CompletableFuture entered the runtime and this library
-# stopped claiming it. 0.8.9 is where java.util.zip entered the runtime, on
-# the zlib every jolt binary links, and where this library stopped shipping
-# gzip/deflate shims of its own over the system libz. An older jolt has neither the classes nor the runtime's answer
-# for them, so a gzip response would fail to decode there; the floor refuses
-# the project instead. Earlier floors, for the record: 0.8.1 (java.util.concurrent's
-# executor interfaces, which babashka.http-client's ->Executor type-checks),
-# 0.8.0 (jolt.ffi/write's argument order), 0.7.19 (jolt's own java.io byte
-# streams answering the full surface).
+# CI tracks jolt's nightly build (release tag vnightly, the rolling build of
+# jolt's main), so a jolt change that breaks this library shows up the day it
+# lands rather than at the next release.
 #
-# The pin is the DECLARED FLOOR, not the newest release, so CI tests the oldest
-# jolt deps.edn claims to support. Raise both together. One leg is enough now:
-# the `:as :stream` live-body path that used to need a second, newer leg
-# (0.8.8's abstract-class method inheritance) is below the floor.
+# That means CI no longer exercises the declared floor. deps.edn still declares
+# :jolt/min-version 0.8.16, which is where java.util.concurrent.CompletableFuture
+# entered the runtime and this library stopped claiming it. Earlier floors, for
+# the record: 0.8.9 (java.util.zip entered the runtime, on the zlib every jolt
+# binary links, and this library stopped shipping gzip/deflate shims of its own
+# over the system libz), 0.8.1 (java.util.concurrent's executor interfaces,
+# which babashka.http-client's ->Executor type-checks), 0.8.0 (jolt.ffi/write's
+# argument order), 0.7.19 (jolt's own java.io byte streams answering the full
+# surface). The `:as :stream` live-body path needs 0.8.8's abstract-class method
+# inheritance, which is below the floor. Raising the floor is a deps.edn change
+# and should be checked against that release by hand.
 
 jobs:
   test:
@@ -23,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        jolt: ['0.8.16']
+        jolt: ['nightly']
     name: test (jolt ${{ matrix.jolt }})
     env:
       JOLT_VERSION: ${{ matrix.jolt }}
