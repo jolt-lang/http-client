@@ -6,7 +6,7 @@
 
   The routes write their headers at once and the body a tick at a time, so a
   client that buffers is visible as a call that takes the whole run."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.java.io :as io]
             [clj-http.lite.util :as util]
             [jolt.http-client :as http]
@@ -92,10 +92,17 @@
 
     {:status 404 :body "nope"}))
 
-(defn- with-server [f]
-  (let [s (srv/start-plain port {:handler handler})]
-    (Thread/sleep 100)
-    (try (f) (finally (srv/stop s)))))
+;; One server for the whole namespace. stop closes the listener, but on Linux a
+;; thread parked in accept() on it keeps the socket listening, so a second
+;; server on the same port fails to bind (seen on CI). Each test runs its body
+;; as a thunk against the one server.
+(use-fixtures :once
+  (fn [t]
+    (let [s (srv/start-plain port {:handler handler})]
+      (Thread/sleep 100)
+      (try (t) (finally (srv/stop s))))))
+
+(defn- with-server [f] (f))
 
 (defn- elapsed [t0] (- (System/currentTimeMillis) t0))
 
