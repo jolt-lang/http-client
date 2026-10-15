@@ -110,7 +110,8 @@
                      :extra-deps {org.babashka/http-client {:mvn/version "0.4.24"}
                                   jolt-lang/multipart
                                   {:git/url "https://github.com/jolt-lang/multipart"
-                                   :git/sha "be6079d3ae9d91bb1e31728c20a69e2a99d5e4fe"}}
+                                   :git/tag "v0.1.1"
+                                   :git/sha "ca51dd47aff27dac3cc09557682e82ec63720310"}}
                      :main-opts ["-m" "jolt.http.babashka-test"]}
            ;; RFC 6455 client + frame codec, driven through
            ;; babashka.http-client.websocket against an in-process echo server.
