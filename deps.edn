@@ -82,8 +82,8 @@
         {:git/url "https://github.com/clj-commons/clj-http-lite"
          :git/sha "5bc2a98969b4926d090787baf9297fd73cea42d0"}
         jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/crypto"
-                               :git/tag "v0.0.10"
-                               :git/sha "feb25f70c76ff1030f621817a31723a183ece80b"}}
+                               :git/tag "v0.2.0"
+                               :git/sha "e6981b853adc543120b785a0c29b6d7d6a10f0fe"}}
 
  ;; libc (BSD sockets, the running process's symbols); libssl/libcrypto come
  ;; from jolt-crypto, loaded before these namespaces so the foreign-fn bindings
