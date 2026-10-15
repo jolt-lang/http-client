@@ -526,7 +526,9 @@
   (let [ok (atom false)
         streaming (atom false)]
     (try
-      (core/s-write stream (core/build-request method url headers body
+      (core/s-write stream (core/build-request method url
+                                               (core/with-user-agent headers (core/default-user-agent :http-client))
+                                               body
                                                (when absolute? (core/spec-no-ref url))))
       (let [resp (core/read-response stream deadline method received
                                      (boolean stream-body?) (boolean body-unbounded?))]

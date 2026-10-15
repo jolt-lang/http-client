@@ -942,6 +942,35 @@
                                (or (not= "HTTP/1.0" version)
                                    (str/includes? conn-hdr "keep-alive"))))})))
 
+;; --- User-Agent --------------------------------------------------------------
+;; The JDK names itself on every request a caller leaves unnamed: HttpURLConnection
+;; as `Java/<version>`, after the http.agent property when that is set, and
+;; java.net.http as `Java-http-client/<version>`. Sending none at all is not
+;; neutral: a CDN in front of an API commonly answers a request with no
+;; User-Agent with a 403 bot-challenge page (Nous Research's inference API does),
+;; so code that works on the JVM failed under jolt. The two shims name jolt the
+;; same way, with jolt's version, since this is not the JDK's.
+(def ^:private runtime-version
+  (delay (let [v (str (try (jolt.host/jolt-version) (catch Throwable _ nil)))]
+           (if (str/blank? v) "dev" (str/replace v #"^v" "")))))
+
+(defn default-user-agent
+  "The User-Agent a request goes out with when its caller set none, for the
+  shim `kind`: :url-connection (HttpURLConnection, which clj-http-lite drives)
+  or :http-client (java.net.http)."
+  [kind]
+  (let [base (str (if (= kind :http-client) "Jolt-http-client/" "Jolt/") @runtime-version)
+        agent (when (= kind :url-connection) (System/getProperty "http.agent"))]
+    (if (str/blank? agent) base (str agent " " base))))
+
+(defn with-user-agent
+  "`headers`, [name value] pairs, with a User-Agent of `ua` added unless one,
+  of any case, is there already: a caller's own always wins."
+  [headers ua]
+  (if (some (fn [p] (= "user-agent" (str/lower-case (str (first p))))) headers)
+    headers
+    (conj (vec headers) ["User-Agent" ua])))
+
 (defn build-request
   "Serialise one HTTP/1.1 request. `absolute-target`, when given, replaces the
   origin-form path with a full URI — the request-target form a plain-http proxy
