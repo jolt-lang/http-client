@@ -13,6 +13,7 @@
             [jolt.http.stream-shim-test]
             [jolt.http.core-test]
             [jolt.http.urlconnection-stream-test]
+            [jolt.http.user-agent-test]
             [clj-http.lite.links-test]
             [clj-http.lite.client-test]
             [clj-http.lite.integration-test]))
@@ -25,6 +26,7 @@
                        'jolt.http.stream-shim-test
                        'jolt.http.core-test
                        'jolt.http.urlconnection-stream-test
+                       'jolt.http.user-agent-test
                        'clj-http.lite.links-test
                        'clj-http.lite.client-test
                        'clj-http.lite.integration-test)]

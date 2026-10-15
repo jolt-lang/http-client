@@ -102,7 +102,10 @@
                  (let [ok (atom false)
                        streaming (atom false)]
                    (try
-                     (s-write stream (build-request method url (tget conn :req-headers) body))
+                     (s-write stream (build-request method url
+                                                    (core/with-user-agent (tget conn :req-headers)
+                                                                          (core/default-user-agent :url-connection))
+                                                    body))
                      (let [r (read-response stream nil method received true)]
                        (if (:body-pull r)
                          (do (reset! streaming true)

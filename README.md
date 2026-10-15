@@ -114,6 +114,12 @@ Restricted request headers behave as `java.net.http` does: setting
 `content-length`, `connection`, `host`, `upgrade` or `expect` on a request is an
 `IllegalArgumentException`, because the client owns them.
 
+A request whose caller sets no `User-Agent` names jolt, the way the JDK names
+itself: `Jolt/<version>` through `HttpURLConnection` (and so `jolt.http-client`),
+after the `http.agent` property when that is set, and `Jolt-http-client/<version>`
+through `java.net.http`. A `User-Agent` the caller sets is sent instead. Some
+APIs' CDNs refuse a request with none.
+
 ## Connections
 
 Connections are pooled and reused per origin. HTTP/1.1 is persistent by default,

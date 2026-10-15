@@ -431,3 +431,15 @@
     (is (= [] (vec (core/concat-bas []))))
     (is (= [2 3] (vec (core/sub-ba (byte-array [1 2 3 4]) 1 3))))
     (is (= [] (vec (core/sub-ba (byte-array [1 2 3]) 2 2))))))
+
+(deftest a-request-names-its-client
+  (let [v (str/replace (str (jolt.host/jolt-version)) #"^v" "")]
+    (is (= (str "Jolt/" v) (core/default-user-agent :url-connection)) "as HttpURLConnection's Java/<version>")
+    (is (= (str "Jolt-http-client/" v) (core/default-user-agent :http-client)) "as java.net.http's Java-http-client/<version>"))
+  (is (= [["Accept" "*/*"] ["User-Agent" "Jolt/x"]] (core/with-user-agent [["Accept" "*/*"]] "Jolt/x")))
+  (testing "a caller's own wins, in any case"
+    (is (= [["user-agent" "mine"]] (core/with-user-agent [["user-agent" "mine"]] "Jolt/x")))
+    (is (= [["USER-AGENT" "mine"]] (core/with-user-agent [["USER-AGENT" "mine"]] "Jolt/x"))))
+  (is (str/includes? (core/ba->latin1 (core/build-request "GET" (core/parse-url "http://h/")
+                                                          (core/with-user-agent [] "Jolt/x") nil))
+                     "\r\nUser-Agent: Jolt/x\r\n")))
