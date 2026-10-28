@@ -83,7 +83,10 @@
   (let [host-streams? @#'jolt.http.platform/host-byte-streams?]
     (if host-streams?
       (testing "jolt models them, so no ctor override and these are jolt's own"
-        (is (= "class java.io.InputStream" (str (type (ByteArrayInputStream. (byte-array 1))))))
+        ;; jolt before 0.8.24 named the host stream by its interface; later
+        ;; versions name the class itself, as the JVM does. Either is jolt's own.
+        (is (contains? #{"class java.io.InputStream" "class java.io.ByteArrayInputStream"}
+                       (str (type (ByteArrayInputStream. (byte-array 1))))))
         (is (not= "class :object" (str (type (ByteArrayOutputStream.))))))
       (testing "jolt cannot answer the surface, so the shim stands in"
         (is (= "class :object" (str (type (ByteArrayInputStream. (byte-array 1))))))))))
