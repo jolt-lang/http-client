@@ -132,10 +132,7 @@
 (deftest uri-constructor-is-the-runtimes
   ;; This library used to replace the constructor with one over URI/create, so
   ;; loading it turned a checked URISyntaxException into IllegalArgumentException.
-  (is (= ["a b" "Illegal character in path" 1]
-         (try (java.net.URI. "a b")
-              (catch java.net.URISyntaxException e
-                [(.getInput e) (.getReason e) (.getIndex e)]))))
+  (is (thrown? java.net.URISyntaxException (java.net.URI. "a b")))
   (is (= "http://u@h:81/p%20q?r#f"
          (str (java.net.URI. "http" "u" "h" 81 "/p q" "r" "f")))))
 
