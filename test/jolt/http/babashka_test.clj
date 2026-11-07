@@ -129,6 +129,13 @@
       (is (= 422 (:status (ex-data e))))
       (is (str/includes? (ex-message e) "Exceptional status code: 422")))))
 
+(deftest uri-constructor-is-the-runtimes
+  ;; This library used to replace the constructor with one over URI/create, so
+  ;; loading it turned a checked URISyntaxException into IllegalArgumentException.
+  (is (thrown? java.net.URISyntaxException (java.net.URI. "a b")))
+  (is (= "http://u@h:81/p%20q?r#f"
+         (str (java.net.URI. "http" "u" "h" 81 "/p q" "r" "f")))))
+
 (deftest decompress-body
   (is (= "gzipped body" (:body (http/get (str base "/gzip")))))
   (is (= "deflated body" (:body (http/get (str base "/deflate")))))
