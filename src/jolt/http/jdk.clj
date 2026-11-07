@@ -744,38 +744,6 @@
   [qualified (last (str/split qualified #"\."))])
 
 (defn install! []
-  ;; --- java.net.URI: the multi-argument constructors ------------------------
-  ;; jolt models URI natively with a one-argument ctor. babashka builds one from
-  ;; a map of parts with the seven-argument ctor, so the ctor is replaced with
-  ;; one that assembles the parts and hands the string back to URI/create — the
-  ;; static, which the override leaves alone, so the object is still jolt's own
-  ;; and every getter keeps working.
-  (letfn [(auth [user host port]
-            (str (when-not (str/blank? (str user)) (str user "@"))
-                 host
-                 (when (and port (number? port) (not (neg? port))) (str ":" port))))
-          (assemble [scheme authority path query fragment]
-            (str scheme ":"
-                 (when-not (str/blank? (str authority)) (str "//" authority))
-                 (or path "")
-                 (when-not (str/blank? (str query)) (str "?" query))
-                 (when-not (str/blank? (str fragment)) (str "#" fragment))))]
-    (reg-ctor! (both "java.net.URI")
-      (fn
-        ([s] (java.net.URI/create (str s)))
-        ;; (scheme, ssp, fragment)
-        ([scheme ssp fragment]
-         (java.net.URI/create (str scheme ":" ssp (when-not (str/blank? (str fragment)) (str "#" fragment)))))
-        ;; (scheme, host, path, fragment)
-        ([scheme host path fragment]
-         (java.net.URI/create (assemble scheme host path nil fragment)))
-        ;; (scheme, authority, path, query, fragment)
-        ([scheme authority path query fragment]
-         (java.net.URI/create (assemble scheme authority path query fragment)))
-        ;; (scheme, userInfo, host, port, path, query, fragment)
-        ([scheme user host port path query fragment]
-         (java.net.URI/create (assemble scheme (auth user host port) path query fragment))))))
-
   ;; --- java.io.SequenceInputStream ------------------------------------------
   ;; Eager: the parts are drained and concatenated at construction. multipart
   ;; bodies are built this way and then read once, so nothing observes laziness —

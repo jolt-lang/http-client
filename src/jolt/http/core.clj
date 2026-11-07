@@ -781,14 +781,11 @@
                              (max 0 (- (alength @buf) @pos))
                              @queue))
       ;; mark/reset over a live stream, by replaying what was read since the
-      ;; mark. java.io.BufferedInputStream is the JVM's mark/reset provider and
-      ;; wrapping ANY stream in one makes markSupported true there — but jolt's
-      ;; BufferedInputStream has no replay layer, so over a stream that cannot
-      ;; seek it is a pass-through with markSupported false. Which means the
-      ;; mark has to live here or nowhere, and it is not optional:
-      ;; babashka.http-client's deflate detection marks, reads, and resets
-      ;; (interceptors/inflate), so without it every `Content-Encoding: deflate`
-      ;; response fails.
+      ;; mark, for jolt's BufferedInputStream before it could mark over a stream
+      ;; that cannot seek. It handed back the wrapped stream, so the mark had to
+      ;; live here: babashka.http-client's deflate detection marks, reads, and
+      ;; resets (interceptors/inflate). The JDK's class never asks the stream it
+      ;; wraps, and neither does jolt's now.
       ;;
       ;; `readlimit` is not honoured, deliberately. The JVM treats it as the
       ;; point past which a mark MAY be dropped and BufferedInputStream keeps
