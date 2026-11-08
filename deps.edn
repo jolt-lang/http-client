@@ -97,6 +97,12 @@
  ;; Tests run clj-http-lite's own client/links/integration suites under Jolt, with
  ;; in-process plaintext + TLS servers in place of the suite's Jetty subprocess.
  :aliases {:test {:extra-paths ["test"]
+                  ;; jolt-lang/multipart parses the bodies :multipart builds
+                  ;; (jolt.http.client-options-test), as in :bhctest
+                  :extra-deps {jolt-lang/multipart
+                               {:git/url "https://github.com/jolt-lang/multipart"
+                                :git/tag "v0.1.1"
+                                :git/sha "ca51dd47aff27dac3cc09557682e82ec63720310"}}
                   :main-opts ["-m" "jolt.http.test-runner"]}
            ;; https read-timeout + OpenSSL symbol-pinning regressions. Separate
            ;; process: they stall connections on purpose and stand up their own
