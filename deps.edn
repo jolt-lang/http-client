@@ -13,7 +13,13 @@
  ;; 0.8.16 is where java.util.concurrent.CompletableFuture entered the runtime;
  ;; the library stopped claiming it then, and that claim was what autoloaded
  ;; jolt.http.jdk for a bare reference to the class on an older jolt.
- :jolt/min-version "0.8.16"
+ ;;
+ ;; 0.8.25 is where java.nio.file.Files/probeContentType answers as the JDK
+ ;; does (jolt-lang/jolt#1554), which jolt.http.multipart types File parts
+ ;; with, as babashka.http-client does. It also fixes 0.8.24's
+ ;; BufferedInputStream, which wrapped a stream it could not mark or reset and
+ ;; so failed deflate responses through babashka.http-client.
+ :jolt/min-version "0.8.25"
 
  :paths ["src"]
 

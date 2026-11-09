@@ -45,7 +45,7 @@ lighter one. This includes multipart, which clj-http-lite does not have:
 
 | Option | |
 | --- | --- |
-| `:multipart` | parts `{:name :content :file-name :content-type :part-name}`. `:content` is a string, File, byte array or InputStream. A File is typed from its extension when the platform cannot probe it. |
+| `:multipart` | parts `{:name :content :file-name :content-type :part-name}`. `:content` is a string, File, byte array or InputStream. A File with no `:content-type` is typed by `Files/probeContentType`, as on the JVM. |
 | `:form-params` | url-encoded on every method but GET and HEAD |
 | `:query-params` | appended to a query the URL already has; any collection value repeats the key |
 | `:basic-auth` | also `{:user :pass}` |
@@ -209,10 +209,14 @@ leaves an arriving body alone.
 
 ## Requirements
 
-- jolt 0.8.16 or newer, declared as `:jolt/min-version`. 0.8.16 is where
+- jolt 0.8.25 or newer, declared as `:jolt/min-version`. 0.8.25 is where
+  `Files/probeContentType` answers as the JDK does, which types multipart
+  File parts, and it fixes 0.8.24's `BufferedInputStream`, which could not
+  mark or reset a wrapped stream and so failed deflate responses through
+  `babashka.http-client`. (0.8.16 is where
   `java.util.concurrent.CompletableFuture` entered the runtime; `sendAsync`
   still returns this library's own future, and a bare `CompletableFuture`
-  reference gets jolt's class. 0.8.9 is where
+  reference gets jolt's class.) 0.8.9 is where
   `java.util.zip` entered the runtime, on the zlib every jolt binary links;
   this library's gzip and deflate decoding runs on those classes and no
   longer ships a libz shim of its own. (The earlier floor, 0.8.1, was

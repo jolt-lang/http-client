@@ -92,7 +92,8 @@
                 "b\r\n"
                 "--B--\r\n")
            (String. ^bytes (mp/body-bytes [{:name "a" :content "b"}] "B") "UTF-8"))))
-  (is (= "text/csv" (mp/file-content-type (io/file "x.CSV"))))
+  ;; the JDK's built-in table, which matches extensions in any case
+  (is (= "application/pdf" (mp/file-content-type (io/file "x.PDF"))))
   (is (= "application/octet-stream" (mp/file-content-type (io/file "noext")))))
 
 ;; --- form and query params ---------------------------------------------------------

@@ -9,12 +9,12 @@
   `:multipart` part keys and the boundary prefix are babashka's, so a request
   built for babashka.http-client builds the same body here.
 
-  Changes from the original: a File part with no :content-type is typed from
-  its extension when java.nio.file.Files/probeContentType has no answer (it
-  answers nil on jolt), byte arrays are accepted as content, and the body is
-  also available as bytes for transports that want a length up front."
-  (:require [clojure.java.io :as io]
-            [clojure.string :as str])
+  Changes from the original: byte arrays are accepted as content, parts are
+  checked before the body is built, and the body is also available as bytes
+  for transports that want a length up front. A File part with no
+  :content-type is typed by java.nio.file.Files/probeContentType, as there;
+  jolt answers it as the JDK does from 0.8.25 (jolt-lang/jolt#1554)."
+  (:require [clojure.java.io :as io])
   (:import [java.io File InputStream]))
 
 ;; A part is a map:
@@ -25,25 +25,12 @@
 ;;   :file-name     the filename; defaults to a File's own name
 ;;   :content-type  the part's media type; :mime-type is accepted too
 
-(def ^:private extension-types
-  {"txt" "text/plain" "html" "text/html" "htm" "text/html" "css" "text/css"
-   "csv" "text/csv" "xml" "application/xml" "json" "application/json"
-   "js" "text/javascript" "edn" "application/edn" "md" "text/markdown"
-   "pdf" "application/pdf" "zip" "application/zip" "gz" "application/gzip"
-   "tar" "application/x-tar" "png" "image/png" "jpg" "image/jpeg"
-   "jpeg" "image/jpeg" "gif" "image/gif" "webp" "image/webp" "svg" "image/svg+xml"
-   "bmp" "image/bmp" "ico" "image/x-icon" "mp3" "audio/mpeg" "wav" "audio/wav"
-   "ogg" "audio/ogg" "mp4" "video/mp4" "webm" "video/webm" "mov" "video/quicktime"})
-
 (defn file-content-type
-  "The media type of `f`: what the platform probes, else its extension's,
-  else application/octet-stream."
+  "The media type of `f`, as java.nio.file.Files/probeContentType answers it
+  (~/.mime.types, the system's mime.types, then the JDK's own table), else
+  application/octet-stream."
   [^File f]
   (or (try (java.nio.file.Files/probeContentType (.toPath f)) (catch Throwable _ nil))
-      (let [n (str/lower-case (.getName f))
-            i (str/last-index-of n ".")]
-        (when (and i (< i (dec (count n))))
-          (get extension-types (subs n (inc i)))))
       "application/octet-stream"))
 
 (defn- content-disposition
