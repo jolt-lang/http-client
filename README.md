@@ -23,6 +23,42 @@ Two clients run on it unmodified:
 (bb/get "https://example.com" {:async true})
 ```
 
+### babashka.http-client's request options on `jolt.http-client`
+
+`jolt.http-client` takes clj-http-lite's request map plus the options below
+from babashka.http-client, so a request written for either client works on the
+lighter one. This includes multipart, which clj-http-lite does not have:
+
+```clojure
+(http/post "https://example.com/upload"
+           {:multipart [{:name "title" :content "Holiday"}
+                        {:name "photo" :content (io/file "beach.png")}   ; filename + image/png
+                        {:name "raw" :content (byte-array [1 2 3]) :file-name "x.bin"}]})
+(http/put "https://example.com/form" {:form-params {:a 1}})          ; any method, not only POST
+(http/get "https://example.com/q?x=1" {:query-params {:a [1 2]}})   ; ?x=1&a=1&a=2
+(http/get url {:basic-auth {:user "u" :pass "p"}
+               :headers {:authorization "Bearer t"}                  ; keyword header names
+               :throw false :as :bytes})
+@(http/get url {:async true :async-then :body :async-catch (fn [{:keys [ex-data]}] (:status ex-data))})
+(http/patch url {:body "x"})
+```
+
+| Option | |
+| --- | --- |
+| `:multipart` | parts `{:name :content :file-name :content-type :part-name}`. `:content` is a string, File, byte array or InputStream. A File with no `:content-type` is typed by `Files/probeContentType`, as on the JVM. |
+| `:form-params` | url-encoded on every method but GET and HEAD |
+| `:query-params` | appended to a query the URL already has; any collection value repeats the key |
+| `:basic-auth` | also `{:user :pass}` |
+| `:headers` | keyword names are sent as their name |
+| `:throw` / `:as :bytes` | babashka's spellings of `:throw-exceptions` / `:as :byte-array` |
+| `:async` | answers a future. `:async-then` and `:async-catch` work as in babashka, and the catch fn gets `{:ex :ex-cause :ex-data :ex-message :request}`. |
+
+The multipart body (`jolt.http.multipart`) and these options are ported from
+[babashka/http-client](https://github.com/babashka/http-client), Copyright (c)
+Michiel Borkent, MIT License (the license text is in
+`licenses/babashka-http-client.LICENSE`). Its multipart is in turn inspired by
+[hato](https://github.com/gnarroway/hato), MIT License.
+
 An app that only reaches for the classes gets them without any require of ours:
 `deps.edn` declares them under `:jolt/provides` (RFC 0014), so jolt autoloads the
 namespace that installs them. That is also what makes a client compiled from a
@@ -173,10 +209,14 @@ leaves an arriving body alone.
 
 ## Requirements
 
-- jolt 0.8.16 or newer, declared as `:jolt/min-version`. 0.8.16 is where
+- jolt 0.8.25 or newer, declared as `:jolt/min-version`. 0.8.25 is where
+  `Files/probeContentType` answers as the JDK does, which types multipart
+  File parts, and it fixes 0.8.24's `BufferedInputStream`, which could not
+  mark or reset a wrapped stream and so failed deflate responses through
+  `babashka.http-client`. (0.8.16 is where
   `java.util.concurrent.CompletableFuture` entered the runtime; `sendAsync`
   still returns this library's own future, and a bare `CompletableFuture`
-  reference gets jolt's class. 0.8.9 is where
+  reference gets jolt's class.) 0.8.9 is where
   `java.util.zip` entered the runtime, on the zlib every jolt binary links;
   this library's gzip and deflate decoding runs on those classes and no
   longer ships a libz shim of its own. (The earlier floor, 0.8.1, was
@@ -188,7 +228,8 @@ leaves an arriving body alone.
 
 | | |
 | --- | --- |
-| `jolt.http-client` | the public clj-http-lite API |
+| `jolt.http-client` | the public clj-http-lite API, plus babashka.http-client's request options |
+| `jolt.http.multipart` | multipart/form-data bodies, ported from babashka.http-client |
 | `jolt.http.core` | the HTTP/1.1 engine: transport, URL parser, request/response codec — shared, so the two client surfaces cannot drift |
 | `jolt.http.net` | BSD sockets over `jolt.ffi` |
 | `jolt.http.tls` | OpenSSL, including PKCS#12 stores and `CONNECT`-tunnel wrapping |
