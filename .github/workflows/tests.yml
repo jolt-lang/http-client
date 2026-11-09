@@ -25,6 +25,12 @@ jobs:
     name: test (jolt ${{ matrix.jolt }})
     env:
       JOLT_VERSION: ${{ matrix.jolt }}
+      # The nightly is built from jolt's main, so it is never older than the
+      # floor in what it carries, but between a release and the next nightly
+      # rebuild it still reports the previous version (v0.8.24-82 just after
+      # 0.8.25 shipped) and the :jolt/min-version check refuses it. The floor
+      # entry in the matrix is what checks the floor.
+      JOLT_SKIP_MIN_VERSION: ${{ matrix.jolt == 'nightly' && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install jolt
