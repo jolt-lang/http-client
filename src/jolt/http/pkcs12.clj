@@ -243,13 +243,16 @@
 
 (defn- matched-certificate
   "PKCS12KeyStore.findMatchedCertificate: a full keyId + alias match wins, then
-  a keyId match, then an alias match."
+  the last keyId match, then the last alias match."
   [entry cert-entries]
   (let [same-alias? #(and (:alias entry) (:alias %)
-                          (= (str/lower-case (:alias entry)) (str/lower-case (:alias %))))]
-    (or (some #(when (and (bytes= (:key-id entry) (:key-id %)) (same-alias? %)) %) cert-entries)
-        (some #(when (bytes= (:key-id entry) (:key-id %)) %) cert-entries)
-        (some #(when (same-alias? %) %) cert-entries))))
+                          (= (str/lower-case (:alias entry)) (str/lower-case (:alias %))))
+        same-id? #(bytes= (:key-id entry) (:key-id %))]
+    ;; the first full match, else the LAST keyId match, else the LAST alias
+    ;; match among the rest: where the JDK's loop leaves its two variables
+    (or (some #(when (and (same-id? %) (same-alias? %)) %) cert-entries)
+        (last (filter same-id? cert-entries))
+        (last (filter #(and (not (same-id? %)) (same-alias? %)) cert-entries)))))
 
 (defn put-entry
   "LinkedHashMap.put: a new alias goes last, an existing one keeps its place."
@@ -263,8 +266,10 @@
 (defn- utf8 [s] (.getBytes ^String s "UTF-8"))
 
 (defn- read-bags
-  "Fold one safe's bags into the load state `st`, as loadSafeContents does."
-  [st bags]
+  "Fold one safe's bags into the load state `st`, as loadSafeContents does.
+  Every X509 taken from a bag goes into `owned` the moment it exists, so the
+  caller frees it whatever throws afterwards."
+  [owned st bags]
   (reduce
    (fn [st [i bag]]
      (let [nid (c-bag-nid bag)
@@ -281,14 +286,18 @@
            (if (nil? key-id)
              st                                ; an unidentifiable second key: skipped
              (let [[st alias] (name-it st)
+                   sig (c-bag-get0-pkcs8 bag)
+                   _ (when (ffi/null? sig) (throw (ex "java.io.IOException" "cannot read a shrouded key bag")))
                    entry {:kind :key :alias alias :key-id key-id
-                          :enc (der-out c-i2d-X509-SIG (c-bag-get0-pkcs8 bag))}]
+                          :enc (der-out c-i2d-X509-SIG sig)}]
                (-> st
                    (update :keys conj (str/lower-case alias))
                    (update :entries put-entry (str/lower-case alias) entry)))))
 
          (and (= nid NID-certBag) (= NID-x509Certificate (c-bag-bag-nid bag)))
          (let [x (c-bag-get1-cert bag)
+               _ (when (ffi/null? x) (throw (ex "java.io.IOException" "cannot read a certificate bag")))
+               _ (vswap! owned conj x)
                cert {:x x :der (der-out c-i2d-X509 x)}
                key-id (or key-id (when (and (= 1 (:key-count st)) (zero? i)) (utf8 "01")))
                st (update st :all conj cert)]
@@ -302,6 +311,19 @@
          :else st)))
    st
    (map-indexed vector bags)))
+
+(defn- openssl-errors
+  "Every error on this thread's OpenSSL queue, oldest first, as text; clears it."
+  []
+  (let [buf (ffi/alloc 256)]
+    (try
+      (loop [acc []]
+        (let [code (c-ERR-get-error)]
+          (if (zero? code)
+            acc
+            (do (c-ERR-error-string-n code buf 256)
+                (recur (conj acc (ffi/ptr->string buf)))))))
+      (finally (ffi/free buf)))))
 
 (defn- openssl-error
   "The oldest error on this thread's OpenSSL queue, as text, and clear the rest."
@@ -345,7 +367,8 @@
 (defn read-store
   "Parse DER PKCS#12 `bytes` with the store password `pass` (a string, or nil
   for none). Returns the entries as {:order [lowercased alias ...] :by {alias
-  entry}}, where an entry is
+  entry} :plain [DER ...]}, :plain being the certificate bags that are no entry
+  and in no key's chain, and an entry is
     {:kind :key :alias :key-id :enc <EncryptedPrivateKeyInfo DER> :chain [DER ...]|nil}
     {:kind :trusted :alias :key-id :cert DER}
   Throws java.io.IOException as the JDK does on a wrong password or a store
@@ -355,7 +378,8 @@
     (when-not p12
       (c-ERR-clear-error)
       (throw (ex "java.io.IOException" "not a PKCS#12 key store: its DER does not parse")))
-    (let [state (volatile! {:entries empty-entries :counter 0 :key-count 0
+    (let [owned (volatile! [])
+          state (volatile! {:entries empty-entries :counter 0 :key-count 0
                             :keys [] :cert-entries [] :all []})]
       (try
         (let [safes (c-unpack-authsafes p12)]
@@ -364,7 +388,7 @@
           (try
             (doseq [p7 (stack-items safes)]
               (when-let [bags (unpack-safe p12 p7 pass)]
-                (try (vswap! state read-bags (stack-items bags))
+                (try (vswap! state #(read-bags owned % (stack-items bags)))
                      (finally (free-stack! bags c-bag-free)))))
             (finally (free-stack! safes c-PKCS7-free))))
         ;; the MAC is checked after the safes, as the JDK does, and not at all
@@ -373,17 +397,21 @@
           (when-not (= 1 (with-cstr pass #(c-PKCS12-verify-mac p12 % -1)))
             (c-ERR-clear-error)
             (throw (integrity-failed))))
-        (let [{:keys [entries keys cert-entries all]} @state]
-          (reduce (fn [entries k]
-                    (let [entry (get-in entries [:by k])
-                          chain (some-> (matched-certificate entry cert-entries) (build-chain all))]
-                      (if (= :key (:kind entry))
-                        (assoc-in entries [:by k :chain] (when (seq chain) (mapv :der chain)))
-                        entries)))
-                  entries
-                  (distinct keys)))
+        (let [{:keys [entries keys cert-entries all]} @state
+              entries (reduce (fn [entries k]
+                                (let [entry (get-in entries [:by k])
+                                      chain (some-> (matched-certificate entry cert-entries) (build-chain all))]
+                                  (if (= :key (:kind entry))
+                                    (assoc-in entries [:by k :chain] (when (seq chain) (mapv :der chain)))
+                                    entries)))
+                              entries
+                              (distinct keys))
+              in-chains (set (for [e (vals (:by entries)) d (:chain e)] (seq d)))]
+          ;; the certificate bags that are no entry and in no chain: nothing to
+          ;; the JDK, but what a plain certificate store is made of
+          (assoc entries :plain (vec (remove #(in-chains (seq %)) (map :der cert-entries)))))
         (finally
-          (doseq [c (:all @state)] (c-X509-free (:x c)))
+          (doseq [x @owned] (c-X509-free x))
           (c-PKCS12-free p12))))))
 
 ;; --- keys -------------------------------------------------------------------
@@ -394,15 +422,20 @@
 
 (defn decrypt-key
   "Decrypt an EncryptedPrivateKeyInfo with `pass`. Returns {:der <PKCS#8 DER>
-  :algorithm \"RSA\"|\"EC\"|\"EdDSA\"|<oid>}, or nil when the password does not
-  decrypt it."
+  :algorithm \"RSA\"|\"EC\"|\"EdDSA\"|<oid>}; {:failed :bad-decrypt} when the
+  password does not open it; or {:failed <OpenSSL's error>} when something
+  else stopped it, a cipher this OpenSSL does not offer or a corrupt bag."
   [enc pass]
   (let [sig (d2i c-d2i-X509-SIG enc)]
     (when-not sig (throw (ex "java.io.IOException" "Private key not stored as PKCS#8 EncryptedPrivateKeyInfo")))
     (try
+      (c-ERR-clear-error)
       (let [p8 (with-cstr (or pass "") #(c-PKCS8-decrypt sig % -1))]
-        (c-ERR-clear-error)
-        (when-not (ffi/null? p8)
+        (if (ffi/null? p8)
+          (let [errs (openssl-errors)]
+            {:failed (if (or (empty? errs) (some #(str/includes? % "bad decrypt") errs))
+                       :bad-decrypt
+                       (first errs))})
           (try
             (let [holder (ffi/alloc ptr-size)]
               (try
@@ -464,9 +497,13 @@
              (throw (ex "java.io.IOException" "cannot set the trusted key usage"))))
         (finally (c-ASN1-OBJECT-free usage))))))
 
-(defn- push-bag! [sk bag attrs]
+(defn- push-bag!
+  "Push `bag` onto `sk`, which owns it from then on, and give it `attrs`."
+  [sk bag attrs]
   (when (ffi/null? bag) (throw (ex "java.io.IOException" "cannot build a PKCS#12 safe bag")))
-  (c-sk-push sk bag)
+  (when-not (pos? (c-sk-push sk bag))
+    (c-bag-free bag)
+    (throw (ex "java.io.IOException" "cannot build a PKCS#12 safe")))
   (add-attrs! bag attrs))
 
 (defn- cert-bag [der]
@@ -490,7 +527,10 @@
       (doseq [{:keys [kind alias key-id enc]} entries :when (= kind :key)]
         (let [sig (d2i c-d2i-X509-SIG enc)]
           (when-not sig (throw (ex "java.io.IOException" "Private key not stored as PKCS#8 EncryptedPrivateKeyInfo")))
-          (push-bag! key-bags (c-bag-create0-pkcs8 sig) {:name alias :key-id key-id})))
+          (let [bag (c-bag-create0-pkcs8 sig)]
+            ;; create0 owns sig only once it has made the bag
+            (when (ffi/null? bag) (c-X509-SIG-free sig))
+            (push-bag! key-bags bag {:name alias :key-id key-id}))))
       (doseq [{:keys [kind alias key-id chain cert]} entries]
         (if (= kind :key)
           (doseq [[i c] (map-indexed vector chain)]

@@ -8,7 +8,10 @@
   happens to do."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.test :refer [deftest is testing]])
+            [clojure.test :refer [deftest is testing]]
+            [jolt.http.core :as core]
+            [jolt.http.pkcs12 :as pkcs12]
+            [jolt.http.tls :as tls])
   (:import [java.security KeyStore MessageDigest]))
 
 ;; JOLT_PWD is set by CI, not by an interactive `jolt -M:test`
@@ -81,6 +84,8 @@
     (testing "a wrong key password"
       (is (= (:wrong-key-password want)
              (caught (.getKey (ks) "chained leaf" (char-array "wrong"))))))
+    (testing "a null key password, on a key under a real one"
+      (is (= (:null-key-password want) (caught (.getKey (ks) "chained leaf" nil)))))
     (testing "an unknown store type"
       (is (= (:unknown-type want) (caught (KeyStore/getInstance "FOO")))))
     (testing "a store that was never loaded"
@@ -204,3 +209,116 @@
   ;; root.pem is the CA the stores chain to; a regenerated fixture set that
   ;; forgot to re-run jvm_expected.clj fails here first
   (is (= (get-in expected [:pem "root.pem"]) (sha (.getEncoded (cert-from-pem "root.pem"))))))
+
+;; --- what the key and trust manager factories hand jolt.http.tls ----------
+(defn- trust-material [ks]
+  (let [tmf (doto (javax.net.ssl.TrustManagerFactory/getInstance "PKIX") (.init ks))]
+    (jolt.host/ref-get (first (.getTrustManagers tmf)) :material)))
+
+(defn- key-material [ks key-pass]
+  (let [kmf (doto (javax.net.ssl.KeyManagerFactory/getInstance "PKIX") (.init ks (char-array key-pass)))]
+    (jolt.host/ref-get (first (.getKeyManagers kmf)) :material)))
+
+(defn- parsed-certs
+  "The certificates OpenSSL's PKCS12_parse finds in a manager's material, as
+  jolt.http.tls reads it."
+  [{:keys [bytes pass]}]
+  (let [{:keys [cert cas free]} (#'tls/parse-pkcs12 bytes pass)]
+    (try (count (remove nil? (cons cert cas))) (finally (free)))))
+
+(deftest material-is-keyed-by-content
+  ;; tls's SSL_CTX cache and core's connection pool key on the material; an
+  ;; identity hash of an array nothing retains can be reused by another store
+  (testing "two loads of one file share a context"
+    (let [a (trust-material (load-ks "keytool-trust.p12" pass))
+          b (trust-material (load-ks "keytool-trust.p12" pass))]
+      (is (some? (:id a)))
+      (is (= (:id a) (:id b)))
+      (is (= (#'tls/ctx-key false {:trust-store a}) (#'tls/ctx-key false {:trust-store b})))
+      (is (= (core/pool-key "h" 443 true false {:trust-store a} nil)
+             (core/pool-key "h" 443 true false {:trust-store b} nil)))))
+  (testing "an unchanged in-memory store is one array, a changed one another"
+    (let [ks (doto (empty-ks) (.setCertificateEntry "root" (cert-from-pem "root.pem")))
+          a (trust-material ks)
+          b (trust-material ks)]
+      (is (identical? (:bytes a) (:bytes b)))
+      (is (= (:id a) (:id b)))
+      (.setCertificateEntry ks "inter" (cert-from-pem "int.pem"))
+      (is (not= (:id a) (:id (trust-material ks))))
+      (is (not= (#'tls/ctx-key false {:trust-store a})
+                (#'tls/ctx-key false {:trust-store (trust-material ks)}))))))
+
+(deftest trust-material-is-certificates-only
+  ;; the key is under "kp", the trust manager has no password: a key bag in
+  ;; the trust material would make PKCS12_parse fail at connect. The JDK
+  ;; trusts the trusted entries and each key entry's own certificate.
+  (let [src (load-ks "openssl-chain.p12" pass)
+        ks (doto (empty-ks)
+             (.setKeyEntry "k" (.getKey src "chained leaf" (char-array pass)) (char-array "kp")
+                           (.getCertificateChain src "chained leaf"))
+             (.setCertificateEntry "root" (cert-from-pem "root.pem")))]
+    (is (= 2 (parsed-certs (trust-material ks))))
+    (testing "and the key manager's material holds the key"
+      (let [{:keys [bytes pass]} (key-material ks "kp")
+            {:keys [key free]} (#'tls/parse-pkcs12 bytes pass)]
+        (try (is (some? key)) (finally (free)))))))
+
+(deftest a-changed-plain-certificate-store-keeps-trusting-its-certificates
+  ;; openssl-plain-certs.p12 is two plain certificate bags: no entries to the
+  ;; JDK, but trusted here while unchanged. Changing it must not drop them.
+  (let [ks (load-ks "openssl-plain-certs.p12" pass)]
+    (is (= 2 (parsed-certs (trust-material ks))))
+    (.setCertificateEntry ks "leaf" (.getCertificate (load-ks "openssl-chain.p12" pass) "chained leaf"))
+    (let [m (trust-material ks)]
+      (is (= 3 (parsed-certs m)))
+      (is (= "" (:pass m)) "re-encoded under the factory's password, not the load password"))))
+
+(deftest key-manager-factories-check-keys-as-the-jdk-does
+  (is (= (:kmf-default-algorithm expected) (javax.net.ssl.KeyManagerFactory/getDefaultAlgorithm)))
+  (testing "SunX509 reads every key at init"
+    (is (= (:kmf-wrong-password (:errors expected))
+           (caught (.init (javax.net.ssl.KeyManagerFactory/getInstance
+                            (javax.net.ssl.KeyManagerFactory/getDefaultAlgorithm))
+                          (load-ks "openssl-chain.p12" pass) (char-array "wrong"))))))
+  (testing "PKIX reads them when it needs them"
+    (is (nil? (.init (javax.net.ssl.KeyManagerFactory/getInstance "PKIX")
+                     (load-ks "openssl-chain.p12" pass) (char-array "wrong"))))))
+
+(deftest a-legacy-key-cipher-is-not-a-wrong-password
+  ;; the key is under RC2-40, in OpenSSL 3's legacy provider
+  (let [ks (load-ks "openssl-key-rc2.p12" pass)
+        r (caught (.getKey ks "rc2 key" (char-array pass)))]
+    (if (:error r)
+      (is (re-find #"^Get Key failed: error:" (:message (:error r))) (pr-str r))
+      (is (= (get-in expected [:legacy-key :entries "rc2 key" :key])
+             {:algorithm (.getAlgorithm r) :format (.getFormat r) :encoded (sha (.getEncoded r))})))))
+
+(deftest jks-instances-read-pkcs12
+  ;; JDK 9+ reads a PKCS12 file through a JKS instance (keystore.type.compat)
+  (let [ks (load-ks "JKS" "openssl-chain.p12" pass)]
+    (is (= (:type (:jks expected)) (.getType ks)))
+    (is (= (dissoc (:jks expected) :type) (describe ks))))
+  (testing "JKS-format content is refused by name"
+    (let [jks (byte-array (map unchecked-byte [0xfe 0xed 0xfe 0xed 0 0 0 2 0 0 0 0]))]
+      (is (re-find #"JKS"
+                   (str (:message (:error (caught (.load (KeyStore/getInstance "JKS")
+                                                         (java.io.ByteArrayInputStream. jks)
+                                                         (char-array "x")))))))))))
+
+(deftest a-throw-mid-safe-frees-every-certificate
+  (let [got (atom 0) freed (atom 0) n (atom 0)
+        get1 pkcs12/c-bag-get1-cert free pkcs12/c-X509-free attrs @#'pkcs12/bag-attributes]
+    (with-redefs [pkcs12/c-bag-get1-cert (fn [b] (swap! got inc) (get1 b))
+                  pkcs12/c-X509-free (fn [x] (swap! freed inc) (free x))
+                  pkcs12/bag-attributes (fn [b] (when (= 3 (swap! n inc)) (throw (ex-info "boom" {})))
+                                          (attrs b))]
+      (is (thrown? Exception (load-ks "openssl-nocertpbe.p12" pass))))
+    (is (pos? @got))
+    (is (= @got @freed))))
+
+(deftest concurrent-changes-are-not-lost
+  (let [ks (empty-ks)
+        root (cert-from-pem "root.pem")
+        fs (doall (for [i (range 40)] (future (.setCertificateEntry ks (str "c" i) root))))]
+    (run! deref fs)
+    (is (= 40 (.size ks)))))

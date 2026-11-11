@@ -182,22 +182,38 @@ AES-256-CBC under PBKDF2 with HMAC-SHA256, a SHA-256 MAC, 10000 iterations.
 
 A store built or changed in memory works as an `:ssl-context` key or trust store
 too. The key and trust manager factories take its entries when they are
-initialised, as on the JDK. A store that was loaded and never changed reaches
-OpenSSL as the bytes it was loaded from, which is how it worked before
-`KeyStore` had entries of its own. One consequence differs from the JDK: a
-PKCS#12 holding only plain certificate bags, such as `openssl pkcs12 -export
--nokeys` writes without `-jdktrust`, has no entries on the JDK but still serves
-here as a trust store of those certificates.
+initialised, as on the JDK, so a change made after that reaches no client
+built from them. A trust manager gets certificates only: the trusted entries
+and each key entry's own certificate, which is what the JDK's trusts. A key
+manager gets the key entries under the factory's password, and the default
+algorithm, `SunX509`, opens every key at `init` and fails there with the JDK's
+`UnrecoverableKeyException` when the password does not; `PKIX` waits until a
+handshake needs the key.
 
-Only `PKCS12` is a type. `JKS`, `JCEKS` and the rest throw `KeyStoreException`
-"`<type>` not found" (the JDK has providers for those). Secret-key entries, the
+A store that was loaded and never changed reaches OpenSSL as the bytes it was
+loaded from, which is how it worked before `KeyStore` had entries of its own.
+One consequence differs from the JDK: a PKCS#12 holding only plain certificate
+bags, such as `openssl pkcs12 -export -nokeys` writes without `-jdktrust`, has
+no entries on the JDK but still serves here as a trust store of those
+certificates. Those certificates stay in its trust material after the store is
+changed, though they are still not entries. A changed store's CA certificates
+from a key entry's chain are not trust anchors, as on the JDK, where the
+unchanged file's are, because OpenSSL reads every certificate in it.
+
+`PKCS12` is a type, and so is `JKS`, because JDK 9 and later read a PKCS12
+file through a `JKS` instance. Its content must still be PKCS12: a JKS-format
+file is refused at `load` with an `IOException` that says so, and `store`
+writes PKCS12 where the JDK would write JKS for a `JKS` instance it loaded
+with `nil`. `JCEKS` and the rest throw `KeyStoreException` "`<type>` not found";
+the JDK has a `JCEKS` provider, but it refuses a PKCS12 file too. Secret-key entries, the
 `KeyStore.Builder`/`ProtectionParameter` forms, `getCreationDate` and
 `getCertificateAlias` are not implemented. Input that is not PKCS#12 at all is
 an `IOException`, where the JDK's DER parser may throw its `EOFException`
 subclass instead. A store whose certificates are under RC2-40, which OpenSSL 1.1
 and older JDKs wrote by default, needs OpenSSL 3's legacy provider; without it
 `load` fails with an `IOException` naming the cipher error rather than the
-password, since the MAC shows the password was right.
+password, since the MAC shows the password was right. `getKey` on a key under
+RC2-40 fails the same way, naming the cipher error.
 
 ## Connections
 
@@ -267,7 +283,7 @@ leaves an arriving body alone.
   `babashka.http-client`'s `->Executor` needs.)
 - OpenSSL (`libssl`/`libcrypto`) for https. `KeyStore` needs OpenSSL 3.0 or
   later: writing a trusted certificate entry uses `PKCS12_add1_attr_by_txt`,
-  which 3.0 added.
+  which the OpenSSL manual (PKCS12_add1_attr_by_NID(3)) says 3.0 added.
 
 ## Namespaces
 

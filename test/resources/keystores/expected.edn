@@ -1,6 +1,157 @@
-{:java-version "25.0.1",
+{:pem
+ {"root.pem"
+  "58cf45e763d685dd81e87faa2190ed603ac800af6625c9fe69fe8fa2d5453603"},
+ :errors
+ {:wrong-password-mac
+  {:error
+   {:class "java.io.IOException",
+    :message
+    "Integrity check failed: java.security.UnrecoverableKeyException: Failed PKCS12 integrity checking",
+    :cause
+    {:class "java.security.UnrecoverableKeyException",
+     :message "Failed PKCS12 integrity checking"}}},
+  :unknown-type
+  {:error
+   {:class "java.security.KeyStoreException",
+    :message "FOO not found",
+    :cause
+    {:class "java.security.NoSuchAlgorithmException",
+     :message "FOO KeyStore not available"}}},
+  :broken-chain
+  {:error
+   {:class "java.security.KeyStoreException",
+    :message "Certificate chain is not valid"}},
+  :wrong-key-password
+  {:error
+   {:class "java.security.UnrecoverableKeyException",
+    :message
+    "Get Key failed: Given final block not properly padded. Such issues can arise if a bad key is used during decryption.",
+    :cause
+    {:class "javax.crypto.BadPaddingException",
+     :message
+     "Given final block not properly padded. Such issues can arise if a bad key is used during decryption."}}},
+  :null-key-password
+  {:error
+   {:class "java.security.UnrecoverableKeyException",
+    :message
+    "Get Key failed: Cannot read the array length because \"password\" is null",
+    :cause
+    {:class "java.lang.NullPointerException",
+     :message
+     "Cannot read the array length because \"password\" is null"}}},
+  :overwrite-key-with-cert
+  {:error
+   {:class "java.security.KeyStoreException",
+    :message "Cannot overwrite own certificate"}},
+  :wrong-password
+  {:error
+   {:class "java.io.IOException",
+    :message "keystore password was incorrect",
+    :cause
+    {:class "java.security.UnrecoverableKeyException",
+     :message
+     "failed to decrypt safe contents entry: javax.crypto.BadPaddingException: Given final block not properly padded. Such issues can arise if a bad key is used during decryption."}}},
+  :key-without-chain
+  {:error
+   {:class "java.lang.IllegalArgumentException",
+    :message "Private key must be accompanied by certificate chain"}},
+  :kmf-wrong-password
+  {:error
+   {:class "java.security.UnrecoverableKeyException",
+    :message
+    "Get Key failed: Given final block not properly padded. Such issues can arise if a bad key is used during decryption.",
+    :cause
+    {:class "javax.crypto.BadPaddingException",
+     :message
+     "Given final block not properly padded. Such issues can arise if a bad key is used during decryption."}}},
+  :uninitialized
+  {:error
+   {:class "java.security.KeyStoreException",
+    :message "Uninitialized keystore"}}},
+ :null-password
+ {:size 1,
+  :aliases ["chained leaf"],
+  :entries
+  {"chained leaf"
+   {:key? true,
+    :cert? false,
+    :cert nil,
+    :chain nil,
+    :key
+    {:algorithm "EC",
+     :format "PKCS#8",
+     :encoded
+     "4911113ebaab5eec0211f5c58ff2bfdb3a6cd3de3065a0ab7fa8e05bf2322b7c"}}}},
+ :legacy-key
+ {:size 1,
+  :aliases ["rc2 key"],
+  :entries
+  {"rc2 key"
+   {:key? true,
+    :cert? false,
+    :cert
+    "4375496ab66bea1133918505b037a143313d93c7c889e65bddf29231e1b4d5a1",
+    :chain
+    ["4375496ab66bea1133918505b037a143313d93c7c889e65bddf29231e1b4d5a1"],
+    :key
+    {:algorithm "EC",
+     :format "PKCS#8",
+     :encoded
+     "4911113ebaab5eec0211f5c58ff2bfdb3a6cd3de3065a0ab7fa8e05bf2322b7c"}}}},
+ :jks
+ {:size 1,
+  :aliases ["chained leaf"],
+  :entries
+  {"chained leaf"
+   {:key? true,
+    :cert? false,
+    :cert
+    "4375496ab66bea1133918505b037a143313d93c7c889e65bddf29231e1b4d5a1",
+    :chain
+    ["4375496ab66bea1133918505b037a143313d93c7c889e65bddf29231e1b4d5a1"
+     "0955ade40ed44294d4064abac6a475e675d7495742ad299002949ce29fcee12b"
+     "58cf45e763d685dd81e87faa2190ed603ac800af6625c9fe69fe8fa2d5453603"],
+    :key
+    {:algorithm "EC",
+     :format "PKCS#8",
+     :encoded
+     "4911113ebaab5eec0211f5c58ff2bfdb3a6cd3de3065a0ab7fa8e05bf2322b7c"}}},
+  :type "JKS"},
+ :java-version "25.0.1",
+ :kmf-default-algorithm "SunX509",
  :stores
- {"keytool-ec2.p12"
+ {"crafted-pairing.p12"
+  {:size 2,
+   :aliases ["k1" "k2"],
+   :entries
+   {"k1"
+    {:key? true,
+     :cert? false,
+     :cert
+     "4375496ab66bea1133918505b037a143313d93c7c889e65bddf29231e1b4d5a1",
+     :chain
+     ["4375496ab66bea1133918505b037a143313d93c7c889e65bddf29231e1b4d5a1"
+      "0955ade40ed44294d4064abac6a475e675d7495742ad299002949ce29fcee12b"
+      "58cf45e763d685dd81e87faa2190ed603ac800af6625c9fe69fe8fa2d5453603"],
+     :key
+     {:algorithm "EC",
+      :format "PKCS#8",
+      :encoded
+      "4911113ebaab5eec0211f5c58ff2bfdb3a6cd3de3065a0ab7fa8e05bf2322b7c"}},
+    "k2"
+    {:key? true,
+     :cert? false,
+     :cert
+     "0955ade40ed44294d4064abac6a475e675d7495742ad299002949ce29fcee12b",
+     :chain
+     ["0955ade40ed44294d4064abac6a475e675d7495742ad299002949ce29fcee12b"
+      "58cf45e763d685dd81e87faa2190ed603ac800af6625c9fe69fe8fa2d5453603"],
+     :key
+     {:algorithm "EC",
+      :format "PKCS#8",
+      :encoded
+      "4911113ebaab5eec0211f5c58ff2bfdb3a6cd3de3065a0ab7fa8e05bf2322b7c"}}}},
+  "keytool-ec2.p12"
   {:size 2,
    :aliases ["first" "second"],
    :entries
@@ -117,20 +268,6 @@
       :encoded
       "4911113ebaab5eec0211f5c58ff2bfdb3a6cd3de3065a0ab7fa8e05bf2322b7c"}}}},
   "openssl-plain-certs.p12" {:size 0, :aliases [], :entries {}}},
- :null-password
- {:size 1,
-  :aliases ["chained leaf"],
-  :entries
-  {"chained leaf"
-   {:key? true,
-    :cert? false,
-    :cert nil,
-    :chain nil,
-    :key
-    {:algorithm "EC",
-     :format "PKCS#8",
-     :encoded
-     "4911113ebaab5eec0211f5c58ff2bfdb3a6cd3de3065a0ab7fa8e05bf2322b7c"}}}},
  :legacy
  {:size 1,
   :aliases ["legacy"],
@@ -148,56 +285,4 @@
     {:algorithm "EC",
      :format "PKCS#8",
      :encoded
-     "4911113ebaab5eec0211f5c58ff2bfdb3a6cd3de3065a0ab7fa8e05bf2322b7c"}}}},
- :pem
- {"root.pem"
-  "58cf45e763d685dd81e87faa2190ed603ac800af6625c9fe69fe8fa2d5453603"},
- :errors
- {:wrong-password
-  {:error
-   {:class "java.io.IOException",
-    :message "keystore password was incorrect",
-    :cause
-    {:class "java.security.UnrecoverableKeyException",
-     :message
-     "failed to decrypt safe contents entry: javax.crypto.BadPaddingException: Given final block not properly padded. Such issues can arise if a bad key is used during decryption."}}},
-  :wrong-password-mac
-  {:error
-   {:class "java.io.IOException",
-    :message
-    "Integrity check failed: java.security.UnrecoverableKeyException: Failed PKCS12 integrity checking",
-    :cause
-    {:class "java.security.UnrecoverableKeyException",
-     :message "Failed PKCS12 integrity checking"}}},
-  :wrong-key-password
-  {:error
-   {:class "java.security.UnrecoverableKeyException",
-    :message
-    "Get Key failed: Given final block not properly padded. Such issues can arise if a bad key is used during decryption.",
-    :cause
-    {:class "javax.crypto.BadPaddingException",
-     :message
-     "Given final block not properly padded. Such issues can arise if a bad key is used during decryption."}}},
-  :unknown-type
-  {:error
-   {:class "java.security.KeyStoreException",
-    :message "FOO not found",
-    :cause
-    {:class "java.security.NoSuchAlgorithmException",
-     :message "FOO KeyStore not available"}}},
-  :uninitialized
-  {:error
-   {:class "java.security.KeyStoreException",
-    :message "Uninitialized keystore"}},
-  :key-without-chain
-  {:error
-   {:class "java.lang.IllegalArgumentException",
-    :message "Private key must be accompanied by certificate chain"}},
-  :overwrite-key-with-cert
-  {:error
-   {:class "java.security.KeyStoreException",
-    :message "Cannot overwrite own certificate"}},
-  :broken-chain
-  {:error
-   {:class "java.security.KeyStoreException",
-    :message "Certificate chain is not valid"}}}}
+     "4911113ebaab5eec0211f5c58ff2bfdb3a6cd3de3065a0ab7fa8e05bf2322b7c"}}}}}

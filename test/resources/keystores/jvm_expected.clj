@@ -9,7 +9,12 @@
 ;; keytool (keytool-*.p12) and the OpenSSL 3 CLI (openssl-*.p12); root.pem and
 ;; int.pem are the CA and intermediate in openssl-chain.p12's chain.
 ;; openssl-legacy-rc2.p12 is `openssl pkcs12 -export -legacy`: certificates
-;; under RC2-40, which OpenSSL 3 keeps in its legacy provider.
+;; under RC2-40, which OpenSSL 3 keeps in its legacy provider, and
+;; openssl-key-rc2.p12 (`-legacy -keypbe PBE-SHA1-RC2-40 -certpbe NONE`) has
+;; its key under RC2-40. crafted-pairing.p12 is written by craft_pairing.clj
+;; (on Jolt, from leaf.pem/leaf.key, which are not kept): two keys whose
+;; certificates the JDK picks by its last-match rules, a localKeyID that two
+;; certificates share and an alias that two certificates share.
 (require '[clojure.java.io :as io] '[clojure.pprint :as pp])
 (import '[java.security KeyStore MessageDigest])
 
@@ -47,19 +52,29 @@
                                   :encoded (sha (.getEncoded k))})}]))}))
 
 (def stores ["keytool-rsa.p12" "keytool-ec2.p12" "openssl-chain.p12" "keytool-trust.p12"
-             "openssl-jdktrust.p12" "openssl-plain-certs.p12" "openssl-nocertpbe.p12"])
+             "openssl-jdktrust.p12" "openssl-plain-certs.p12" "openssl-nocertpbe.p12"
+             "crafted-pairing.p12"])
 
 (pp/pprint
   {:java-version (System/getProperty "java.version")
+   :kmf-default-algorithm (javax.net.ssl.KeyManagerFactory/getDefaultAlgorithm)
+   :jks (let [ks (with-open [in (io/input-stream (str dir "/openssl-chain.p12"))]
+                   (doto (KeyStore/getInstance "JKS") (.load in (char-array pass))))]
+          (assoc (describe ks) :type (.getType ks)))
    :stores (into (sorted-map) (for [f stores] [f (describe (load-ks f pass))]))
    :null-password (describe (load-ks "openssl-chain.p12" nil))
    :legacy (describe (load-ks "openssl-legacy-rc2.p12" pass))
+   :legacy-key (describe (load-ks "openssl-key-rc2.p12" pass))
    :pem {"root.pem" (sha (.getEncoded (.generateCertificate (java.security.cert.CertificateFactory/getInstance "X.509")
                                                            (io/input-stream (str dir "/root.pem")))))}
    :errors {:wrong-password (caught (load-ks "openssl-chain.p12" "wrong"))
             :wrong-password-mac (caught (load-ks "openssl-nocertpbe.p12" "wrong"))
             :wrong-key-password (caught (.getKey (load-ks "openssl-chain.p12" pass) "chained leaf" (char-array "wrong")))
             :unknown-type (caught (KeyStore/getInstance "FOO"))
+            :null-key-password (caught (.getKey (load-ks "openssl-chain.p12" pass) "chained leaf" nil))
+            :kmf-wrong-password (caught (.init (javax.net.ssl.KeyManagerFactory/getInstance
+                                                 (javax.net.ssl.KeyManagerFactory/getDefaultAlgorithm))
+                                               (load-ks "openssl-chain.p12" pass) (char-array "wrong")))
             :uninitialized (caught (.size (KeyStore/getInstance "PKCS12")))
             :key-without-chain (caught (let [ks (load-ks "openssl-chain.p12" pass)]
                                          (.setKeyEntry ks "x" (.getKey ks "chained leaf" (char-array pass))
