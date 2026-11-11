@@ -9,6 +9,7 @@
   (:require [jolt.http.platform]                 ;; installs the host shims
             [clojure.test :as t]
             [jolt.http.deps-test]
+            [jolt.http.load-warnings-test]
             [jolt.http.net-platform-test]
             [jolt.http.stream-shim-test]
             [jolt.http.core-test]
@@ -23,6 +24,7 @@
   ;; Name the suites: a bare (t/run-tests) runs only *ns*, which here is not
   ;; any of them, so the runner reported 0 tests and exited clean.
   (let [r (t/run-tests 'jolt.http.deps-test
+                       'jolt.http.load-warnings-test
                        'jolt.http.net-platform-test
                        'jolt.http.stream-shim-test
                        'jolt.http.core-test
