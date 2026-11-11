@@ -394,12 +394,18 @@
 ;; a function of how many requests it makes.
 (def ^:private ctx-cache (atom {}))
 
+(defn store-key
+  "What identifies a store's material: its :id, a digest of its content taken
+  once when the key or trust manager factory was initialised (jolt.http.jdk).
+  An identity hash is the fallback for material without one; the cache does
+  not retain the array, so that hash can come back for another one."
+  [m]
+  (when m [(or (:id m) (System/identityHashCode (:bytes m))) (:pass m)]))
+
 (defn- ctx-key [insecure? ssl]
-  ;; the stores are byte-arrays; identity is what distinguishes two clients,
-  ;; and hashing megabytes of PKCS#12 per request would defeat the point
-  [(boolean insecure?)
-   (when-let [ks (:key-store ssl)] [(System/identityHashCode (:bytes ks)) (:pass ks)])
-   (when-let [ts (:trust-store ssl)] [(System/identityHashCode (:bytes ts)) (:pass ts)])])
+  ;; hashing megabytes of PKCS#12 per request would defeat the point, which is
+  ;; why the digest is taken once, upstream
+  [(boolean insecure?) (store-key (:key-store ssl)) (store-key (:trust-store ssl))])
 
 (defn- client-ctx [insecure? ssl]
   (let [k (ctx-key insecure? ssl)]

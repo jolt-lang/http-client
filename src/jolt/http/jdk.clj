@@ -20,6 +20,7 @@
             [jolt.crypto]                ;; java.security.SecureRandom (real, RAND_bytes)
             [jolt.http.core :as core]
             [jolt.http.net :as net]
+            [jolt.http.pkcs12 :as pkcs12]
             [jolt.http.tls :as tls]))
 
 (def ^:private tt core/tt)
@@ -202,16 +203,14 @@
 (defn- ssl-context-insecure? [ctx]
   (boolean (and ctx (tget ctx :insecure))))
 
-(defn- store-material [ks]
-  (when (and ks (tget ks :bytes))
-    {:bytes (tget ks :bytes) :pass (tget ks :pass)}))
-
 (defn- ssl-material
-  "The PKCS#12 material an SSLContext carries, in the shape jolt.http.tls wants."
+  "The PKCS#12 material an SSLContext carries, in the shape jolt.http.tls wants.
+  The key and trust managers took it from their stores when their factory was
+  initialised (see store-material)."
   [ctx]
   (when ctx
-    (let [key-store (store-material (tget ctx :key-store))
-          trust-store (store-material (tget ctx :trust-store))]
+    (let [key-store (tget ctx :key-store)
+          trust-store (tget ctx :trust-store)]
       (when (or key-store trust-store)
         {:key-store key-store :trust-store trust-store}))))
 
@@ -230,6 +229,305 @@
   "Register the fn HttpClient.newWebSocketBuilder() calls (of the client)."
   [f]
   (reset! websocket-builder f))
+
+;; ---------------------------------------------------------------------------
+;; java.security.KeyStore (PKCS12)
+;; ---------------------------------------------------------------------------
+;; A store's state is ONE map in an atom, so a reader (store-material, a getter
+;; on another thread) always sees a consistent snapshot and every change is a
+;; single swap!, as the JDK's synchronized methods are:
+;;
+;;   {:loaded   false until load
+;;    :entries  {:order [lowercased alias ...] :by {alias entry}}
+;;    :plain    [cert DER ...]  certificate bags that are no entry (see below)
+;;    :bytes :pass :id          the PKCS#12 the store was loaded from, until the first change
+;;    :version  bumped by every change
+;;    :material {[kind pass] material} what the factories took, for this version}
+;;
+;; jolt.http.pkcs12 reads and writes the DER; the certificates here are
+;; jolt-crypto's X509Certificate objects and the keys its PrivateKey, so
+;; getEncoded on either is the DER the JVM hands back. An entry is
+;;
+;;   {:kind :key     :alias :key-id :enc <EncryptedPrivateKeyInfo DER> :chain [cert ...]|nil}
+;;   {:kind :trusted :alias :key-id :cert cert}
+;;
+;; and a key stays encrypted, as on the JDK, until getKey opens it.
+(defn- ks-ex
+  ([msg] (jolt.host/throwable "java.security.KeyStoreException" msg))
+  ([msg cause] (jolt.host/throwable "java.security.KeyStoreException" msg cause)))
+
+(defn- chars->str [cs] (when cs (apply str (seq cs))))
+
+(defn- sha256-hex [^bytes b]
+  (apply str (map #(let [h (Integer/toHexString (bit-and % 0xff))] (if (= 1 (count h)) (str "0" h) h))
+                  (.digest (java.security.MessageDigest/getInstance "SHA-256") b))))
+
+;; JDK 9+ reads PKCS12 through a "JKS" instance too (keystore.type.compat), so
+;; that is accepted and holds PKCS12 content. JCEKS is not: the JVM refuses a
+;; PKCS12 file loaded through it ("Invalid keystore format").
+(def ^:private keystore-types #{"pkcs12" "jks"})
+
+(defn- keystore-instance [type]
+  (let [t (str type)]
+    ;; the JDK's words for a type no provider has
+    (when-not (keystore-types (str/lower-case t))
+      (throw (ks-ex (str t " not found")
+                    (jolt.host/throwable "java.security.NoSuchAlgorithmException"
+                                         (str t " KeyStore not available")))))
+    (doto (tt :jolt.http/keystore)
+      (tput! :type t)
+      (tput! :state (atom {:loaded false :entries pkcs12/empty-entries :plain []
+                           :version 0 :material {}})))))
+
+(defn- ks-state [ks] @(tget ks :state))
+
+(defn- loaded! [s]
+  (when-not (:loaded s) (throw (ks-ex "Uninitialized keystore")))
+  s)
+
+(defn- ks-entry [ks alias]
+  (get-in (loaded! (ks-state ks)) [:entries :by (str/lower-case (str alias))]))
+
+(defn- ks-change!
+  "Apply f to the entries as one swap!. f may throw to refuse the change. The
+  loaded bytes, their password and the factories' material all go with it."
+  [ks f]
+  (swap! (tget ks :state)
+         (fn [s]
+           (-> (loaded! s)
+               (update :entries f)
+               (assoc :bytes nil :pass nil :id nil :material {})
+               (update :version inc))))
+  nil)
+
+(defn- der->cert [der]
+  (.generateCertificate (java.security.cert.CertificateFactory/getInstance "X.509") der))
+
+(defn- cert->der [c]
+  {:der (.getEncoded c) :name (.getName (.getSubjectX500Principal c))})
+
+(defn- entries-for-write [{:keys [order by]}]
+  {:order order
+   :by (into {} (for [[k e] by]
+                  [k (case (:kind e)
+                       :key (update e :chain #(mapv cert->der %))
+                       :trusted (update e :cert cert->der))]))})
+
+(defn- unrecoverable [msg cause]
+  (if cause
+    (jolt.host/throwable "java.security.UnrecoverableKeyException" msg cause)
+    (jolt.host/throwable "java.security.UnrecoverableKeyException" msg)))
+
+(defn- private-key? [k]
+  (try (contains? #{"PKCS#8" "PKCS8"} (.getFormat k)) (catch Throwable _ false)))
+
+(defn- check-x509! [certs]
+  (doseq [c certs]
+    (when-not (instance? java.security.cert.X509Certificate c)
+      (throw (ks-ex (str "Only X.509 certificates are supported - rejecting class: "
+                         (.getName (class c))))))))
+
+(defn- jks-format? [^bytes b]
+  (and (>= (alength b) 4)
+       (= [0xfe 0xed 0xfe 0xed] (mapv #(bit-and (aget b %) 0xff) (range 4)))))
+
+(defn- ks-load [self stream pass]
+  ;; load(null, …) leaves the entries alone and marks the store usable, as
+  ;; the JDK's engineLoad returns before touching them
+  (if (nil? stream)
+    (swap! (tget self :state) assoc :loaded true)
+    (let [bytes (core/->bytes stream)
+          _ (when (jks-format? bytes)
+              (throw (jolt.host/throwable "java.io.IOException"
+                                          "JKS-format key stores are not supported on Jolt; this KeyStore reads PKCS12")))
+          pass (chars->str pass)
+          {:keys [order by plain]} (pkcs12/read-store bytes pass)
+          entries {:order order
+                   :by (into {} (for [[k e] by]
+                                  [k (case (:kind e)
+                                       :key (update e :chain #(some->> % (mapv der->cert)))
+                                       :trusted (update e :cert der->cert))]))}]
+      (swap! (tget self :state)
+             (fn [s] (-> s
+                         (assoc :loaded true :entries entries :plain (vec plain)
+                                :bytes bytes :pass pass :id (sha256-hex bytes) :material {})
+                         (update :version inc))))))
+  nil)
+
+;; what the JDK's cipher and PBE code say for a password that does not open a key
+(def ^:private bad-padding
+  "Given final block not properly padded. Such issues can arise if a bad key is used during decryption.")
+(def ^:private null-password
+  "Cannot read the array length because \"password\" is null")
+
+(defn- ks-get-key [self alias pass]
+  (let [e (ks-entry self alias)]
+    (when (= :key (:kind e))
+      (let [{:keys [der algorithm failed]} (pkcs12/decrypt-key (:enc e) (chars->str pass))]
+        (cond
+          ;; a key under "" opens with null too; any other key is the JDK's NPE
+          (and failed (nil? pass))
+          (throw (unrecoverable (str "Get Key failed: " null-password)
+                                (jolt.host/throwable "java.lang.NullPointerException" null-password)))
+          (= :bad-decrypt failed)
+          (throw (unrecoverable (str "Get Key failed: " bad-padding)
+                                (jolt.host/throwable "javax.crypto.BadPaddingException" bad-padding)))
+          failed
+          (throw (unrecoverable (str "Get Key failed: " failed) nil))
+          :else
+          (try
+            (.generatePrivate (java.security.KeyFactory/getInstance algorithm)
+                              (java.security.spec.PKCS8EncodedKeySpec. der))
+            (catch Throwable t
+              (throw (unrecoverable (str "Get Key failed: " (ex-message t)) t)))))))))
+
+(defn- ks-set-key-entry [self alias key pass chain]
+  (loaded! (ks-state self))
+  (let [chain (when chain (vec (seq chain)))]
+    (when-not (private-key? key)
+      (throw (ks-ex "Unsupported Key type (this KeyStore stores private keys only)")))
+    (when (empty? chain)
+      (throw-typed "java.lang.IllegalArgumentException" "Private key must be accompanied by certificate chain"))
+    (check-x509! chain)
+    (when (and (> (count chain) 1) (not (pkcs12/chain-valid? (mapv #(.getEncoded %) chain))))
+      (throw (ks-ex "Certificate chain is not valid")))
+    (let [alias (str/lower-case (str alias))
+          entry {:kind :key
+                 :alias alias
+                 ;; the JDK's localKeyID for a key it is handed
+                 :key-id (.getBytes (str "Time " (System/currentTimeMillis)) "UTF-8")
+                 :enc (pkcs12/encrypt-key (.getEncoded key) (chars->str pass))
+                 :chain chain}]
+      (ks-change! self #(pkcs12/put-entry % alias entry)))))
+
+(defn- ks-set-cert-entry [self alias cert]
+  (loaded! (ks-state self))
+  (check-x509! (when cert [cert]))
+  (let [k (str/lower-case (str alias))]
+    ;; the check is inside the swap!, so it sees the entry it replaces
+    (ks-change! self (fn [entries]
+                       (when (= :key (get-in entries [:by k :kind]))
+                         (throw (ks-ex "Cannot overwrite own certificate")))
+                       ;; a trusted entry keeps the caller's spelling as its
+                       ;; friendlyName, as the JDK's CertEntry does
+                       (pkcs12/put-entry entries k {:kind :trusted :alias (str alias) :key-id nil :cert cert})))))
+
+(defn- ks-delete [self alias]
+  (let [k (str/lower-case (str alias))]
+    (when (contains? (:by (:entries (loaded! (ks-state self)))) k)
+      (ks-change! self (fn [{:keys [order by]}]
+                         {:order (filterv #(not= k %) order) :by (dissoc by k)})))
+    nil))
+
+(defn- ks-store [self out pass]
+  (let [s (loaded! (ks-state self))]
+    (.write out (pkcs12/write-store (entries-for-write (:entries s)) (chars->str pass)))
+    (.flush out)
+    nil))
+
+(defn- ks-entries [self] (:entries (loaded! (ks-state self))))
+
+(def ^:private keystore-methods
+  {"getType" (fn [self] (tget self :type))
+   "load" ks-load
+   "aliases" (fn [self] (java.util.Collections/enumeration (:order (ks-entries self))))
+   "containsAlias" (fn [self alias] (some? (ks-entry self alias)))
+   "size" (fn [self] (count (:order (ks-entries self))))
+   "isKeyEntry" (fn [self alias] (= :key (:kind (ks-entry self alias))))
+   "isCertificateEntry" (fn [self alias] (= :trusted (:kind (ks-entry self alias))))
+   "getCertificate" (fn [self alias]
+                      (let [e (ks-entry self alias)]
+                        (case (:kind e)
+                          :key (first (:chain e))
+                          :trusted (:cert e)
+                          nil)))
+   "getCertificateChain" (fn [self alias]
+                           (let [e (ks-entry self alias)]
+                             (when (and (= :key (:kind e)) (seq (:chain e)))
+                               (into-array (:chain e)))))
+   "getKey" ks-get-key
+   "setKeyEntry" ks-set-key-entry
+   "setCertificateEntry" ks-set-cert-entry
+   "deleteEntry" ks-delete
+   "store" ks-store})
+
+;; --- what a key or trust manager hands jolt.http.tls ------------------------
+(defn- content-id
+  "A digest of what a re-encoded material is made of, so two stores holding
+  the same things share an SSL_CTX and connection pool, whatever random salts
+  the encoding drew."
+  [kind pass pieces]
+  (let [out (java.io.ByteArrayOutputStream.)
+        put (fn [^bytes b]
+              (let [n (alength b)]
+                (.write out (byte-array (map #(unchecked-byte (bit-shift-right n %)) [24 16 8 0])))
+                (.write out b)))]
+    (put (.getBytes (str (name kind) ":" pass) "UTF-8"))
+    (doseq [p pieces] (put p))
+    (sha256-hex (.toByteArray out))))
+
+(defn- trust-material
+  "Certificates only, under \"\": the trusted entries and each key entry's own
+  certificate, which is what the JDK's TrustManagerFactory trusts
+  (TrustStoreUtil.getTrustedCerts), then the plain certificate bags the store
+  was loaded with, which it trusted here while unchanged."
+  [s]
+  (let [{:keys [order by]} (:entries s)
+        ders (->> (concat (keep (fn [k] (let [e (by k)]
+                                          (some-> (if (= :key (:kind e)) (first (:chain e)) (:cert e))
+                                                  .getEncoded)))
+                                order)
+                          (:plain s))
+                  (reduce (fn [acc d] (if (some #(= (seq d) (seq %)) acc) acc (conj acc d))) []))
+        entries {:order (mapv str (range (count ders)))
+                 :by (into {} (map-indexed (fn [i d] [(str i) {:kind :trusted :alias (str i) :cert {:der d}}])
+                                           ders))}]
+    {:bytes (pkcs12/write-store entries "") :pass "" :id (content-id :trust "" ders)}))
+
+(defn- key-material
+  "The key entries and their chains, under the KeyManagerFactory's password,
+  which must open the keys, as on the JDK."
+  [s pass]
+  (let [{:keys [order by]} (:entries s)
+        keys (filter #(= :key (:kind (by %))) order)
+        entries {:order (vec keys) :by (select-keys by keys)}
+        w (entries-for-write entries)]
+    {:bytes (pkcs12/write-store w pass) :pass pass
+     :id (content-id :key pass (mapcat (fn [k] (cons (get-in w [:by k :enc]) (map :der (get-in w [:by k :chain]))))
+                                       keys))}))
+
+(defn- store-material
+  "What a :key or :trust manager over `ks` hands jolt.http.tls: {:bytes :pass
+  :id}. :id is what tls's SSL_CTX cache and core's pool key on. A store that
+  was loaded and never changed is the bytes it was loaded from under its load
+  password, exactly as before KeyStore had entries of its own. One built or
+  changed in memory is encoded from its entries (trust-material,
+  key-material), once per version of the store. Taken when the factory is
+  initialised, as the JDK's factories read their store then."
+  [ks kind pass]
+  (when (and ks (= :jolt.http/keystore (type-of ks)))
+    (let [s (ks-state ks)
+          k [kind pass]]
+      (when (:loaded s)
+        (cond
+          (:bytes s) {:bytes (:bytes s) :pass (:pass s) :id (:id s)}
+          (get-in s [:material k]) (get-in s [:material k])
+          :else
+          (let [m (if (= kind :trust) (trust-material s) (key-material s (or pass "")))]
+            ;; keep it only if the store has not changed meanwhile
+            (swap! (tget ks :state)
+                   (fn [s'] (if (= (:version s') (:version s)) (assoc-in s' [:material k] m) s')))
+            m))))))
+
+(defn- check-keys!
+  "SunX509KeyManagerImpl reads every key entry with the factory's password at
+  init, so a password that opens none of them fails there, with getKey's
+  exception. (The PKIX manager reads them when it needs one.)"
+  [ks pass]
+  (when (and ks (= :jolt.http/keystore (type-of ks)))
+    (let [{:keys [order by]} (ks-entries ks)]
+      (doseq [k order :when (= :key (:kind (by k)))]
+        (ks-get-key ks k (when pass (char-array pass)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Cookies
@@ -873,37 +1171,52 @@
                             nil)
      "getAcceptedIssuers" (fn [_self] (into-array []))})
 
-  ;; KeyStore / KeyManagerFactory / TrustManagerFactory: the PKCS#12 material a
-  ;; caller loads is carried through to jolt.http.tls, which hands it to OpenSSL.
+  ;; KeyStore: a real PKCS#12 store (keystore-methods, over jolt.http.pkcs12).
+  ;; KeyManagerFactory / TrustManagerFactory snapshot a store's contents as
+  ;; PKCS#12 bytes when they are initialised, as the JDK's read their store
+  ;; then; jolt.http.tls hands those bytes to OpenSSL.
+  (doseq [[c supers] [["java.security.GeneralSecurityException" ["java.lang.Exception"]]
+                      ["java.security.KeyStoreException" ["java.security.GeneralSecurityException"]]
+                      ["java.security.NoSuchAlgorithmException" ["java.security.GeneralSecurityException"]]
+                      ["java.security.UnrecoverableEntryException" ["java.security.GeneralSecurityException"]]
+                      ["java.security.UnrecoverableKeyException" ["java.security.UnrecoverableEntryException"]]
+                      ["javax.crypto.BadPaddingException" ["java.security.GeneralSecurityException"]]]]
+    (jolt.host/register-class-supers! c supers))
   (reg-statics! (both "java.security.KeyStore")
-    {"getInstance" (fn [type & _] (doto (tt :jolt.http/keystore) (tput! :type (str type))))
+    {"getInstance" (fn [type & _] (keystore-instance type))
      "getDefaultType" (fn [& _] "pkcs12")})
-  (__register-class-methods! :jolt.http/keystore
-    {"load" (fn [self stream pass]
-              (tput! self :bytes (when stream (core/->bytes stream)))
-              (tput! self :pass (when pass (apply str (seq pass))))
-              nil)
-     "size" (fn [self] (if (tget self :bytes) 1 0))})
-  (doseq [[nm kind] [["javax.net.ssl.KeyManagerFactory" :key]
-                     ["KeyManagerFactory" :key]
-                     ["javax.net.ssl.TrustManagerFactory" :trust]
-                     ["TrustManagerFactory" :trust]]]
+  (__register-class-methods! :jolt.http/keystore keystore-methods)
+  ;; the JDK's defaults: SunX509 for keys, PKIX for trust
+  (doseq [[nm kind default] [["javax.net.ssl.KeyManagerFactory" :key "SunX509"]
+                             ["KeyManagerFactory" :key "SunX509"]
+                             ["javax.net.ssl.TrustManagerFactory" :trust "PKIX"]
+                             ["TrustManagerFactory" :trust "PKIX"]]]
     (__register-class-statics! nm
-      {"getInstance" (fn [& _] (doto (tt :jolt.http/km-factory) (tput! :kind kind)))
-       "getDefaultAlgorithm" (fn [& _] "PKIX")}))
+      {"getInstance" (fn [& [algo]] (doto (tt :jolt.http/km-factory)
+                                      (tput! :kind kind)
+                                      (tput! :algorithm (str (or algo default)))))
+       "getDefaultAlgorithm" (fn [& _] default)}))
   (__register-class-methods! :jolt.http/km-factory
     {"init" (fn [self ks & args]
-              (tput! self :keystore ks)
-              (tput! self :pass (when-let [p (first args)] (apply str (seq p))))
+              (let [pass (when-let [p (first args)] (apply str (seq p)))
+                    kind (tget self :kind)]
+                (when (and (= :key kind) (= "SUNX509" (str/upper-case (str (tget self :algorithm)))))
+                  (check-keys! ks pass))
+                (tput! self :keystore ks)
+                (tput! self :pass pass)
+                (tput! self :material (store-material ks kind pass)))
               nil)
+     "getAlgorithm" (fn [self] (tget self :algorithm))
      "getKeyManagers" (fn [self]
                         (into-array [(doto (tt :jolt.http/store-manager)
                                        (tput! :kind :key)
-                                       (tput! :keystore (tget self :keystore)))]))
+                                       (tput! :keystore (tget self :keystore))
+                                       (tput! :material (tget self :material)))]))
      "getTrustManagers" (fn [self]
                           (into-array [(doto (tt :jolt.http/store-manager)
                                          (tput! :kind :trust)
-                                         (tput! :keystore (tget self :keystore)))]))})
+                                         (tput! :keystore (tget self :keystore))
+                                         (tput! :material (tget self :material)))]))})
   ;; A manager backed by a real keystore refuses an empty chain, so it never
   ;; trips the insecure probe.
   (__register-class-methods! :jolt.http/store-manager
@@ -927,7 +1240,7 @@
               (let [kms (when kms (seq kms))
                     tms (when tms (seq tms))
                     store-of (fn [m] (when (= :jolt.http/store-manager (type-of m))
-                                       (tget m :keystore)))]
+                                       (tget m :material)))]
                 (tput! self :key-store (some store-of kms))
                 (tput! self :trust-store (some store-of tms))
                 (tput! self :insecure (boolean (some accepts-empty-chain? tms))))

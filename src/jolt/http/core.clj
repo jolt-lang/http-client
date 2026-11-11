@@ -279,8 +279,7 @@
   configures the transport to it."
   [host port https? insecure? ssl proxy]
   [(str host) port (boolean https?) (boolean insecure?)
-   (when ssl [(System/identityHashCode (get-in ssl [:key-store :bytes]))
-              (System/identityHashCode (get-in ssl [:trust-store :bytes]))])
+   (when ssl [(tls/store-key (:key-store ssl)) (tls/store-key (:trust-store ssl))])
    proxy])
 
 (defn- expired? [e now] (>= (- now (:at e)) @pool-idle-ms))
