@@ -67,7 +67,7 @@
 (def ^:private SET-TLSEXT-HOSTNAME 55)
 (def ^:private NAMETYPE-host-name 0)
 (def ^:private FILETYPE-PEM 1)
-(def ^:private chunk 16384)
+(def ^:private chunk-size 16384)
 
 (ffi/defcfn c-TLS-client-method "TLS_client_method" [] :pointer)
 (ffi/defcfn c-TLS-server-method "TLS_server_method" [] :pointer)
@@ -249,10 +249,10 @@
       ;; return a decrypted byte-array chunk, or nil at EOF.
       (fn [self _timeout]
         (when-not (jolt.host/ref-get self :eof)
-          (let [tmp (ffi/alloc chunk)]
+          (let [tmp (ffi/alloc chunk-size)]
             (try
               (loop []
-                (let [got (c-SSL-read (jolt.host/ref-get self :ssl) tmp chunk)]
+                (let [got (c-SSL-read (jolt.host/ref-get self :ssl) tmp chunk-size)]
                   (if (pos? got)
                     (ffi/read-array tmp got)
                     (let [err (c-SSL-get-error (jolt.host/ref-get self :ssl) got)]
