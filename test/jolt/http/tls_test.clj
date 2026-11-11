@@ -10,6 +10,7 @@
   (:require [jolt.http.platform]
             [babashka.http-client :as http]
             [babashka.http-client.websocket :as ws]
+            [clojure.java.io :as io]
             [jolt.http.bhc-routes :as routes]
             [jolt.http.test-server :as srv]
             [jolt.http.tls :as tls]
@@ -71,6 +72,45 @@
                                       :trust-store truststore
                                       :trust-store-pass "jolt"}})]
     (is (= "200 OK" (:body (http/get (str base "/200") {:client c}))))))
+
+(defn- pem-cert [path]
+  (.generateCertificate (java.security.cert.CertificateFactory/getInstance "X.509")
+                        (io/input-stream path)))
+
+(defn- ssl-context-over [tms]
+  (doto (javax.net.ssl.SSLContext/getInstance "TLS") (.init nil tms nil)))
+
+(deftest a-trust-store-built-in-memory
+  (testing "a KeyStore filled with setCertificateEntry is a trust store"
+    (let [ks (doto (java.security.KeyStore/getInstance "PKCS12")
+               (.load nil nil)
+               (.setCertificateEntry "server" (pem-cert cert)))
+          tmf (doto (javax.net.ssl.TrustManagerFactory/getInstance
+                      (javax.net.ssl.TrustManagerFactory/getDefaultAlgorithm))
+                (.init ks))
+          c (http/client {:ssl-context (ssl-context-over (.getTrustManagers tmf))})]
+      (is (= "200 OK" (:body (http/get (str base "/200") {:client c}))))))
+  (testing "and one with no certificate in it trusts nothing"
+    (let [ks (doto (java.security.KeyStore/getInstance "PKCS12") (.load nil nil))
+          tmf (doto (javax.net.ssl.TrustManagerFactory/getInstance "PKIX") (.init ks))
+          c (http/client {:ssl-context (ssl-context-over (.getTrustManagers tmf))})]
+      (is (thrown? Exception (http/get (str base "/200") {:client c}))))))
+
+(deftest a-key-store-built-in-memory
+  ;; the server asks for no client certificate, so what proves the store
+  ;; reaches OpenSSL is the material the key manager hands jolt.http.tls
+  (let [src (doto (java.security.KeyStore/getInstance "PKCS12")
+              (.load (io/input-stream keystore) (char-array "jolt")))
+        ks (doto (java.security.KeyStore/getInstance "PKCS12") (.load nil nil))]
+    (.setKeyEntry ks "client" (.getKey src "localhost" (char-array "jolt")) (char-array "kp")
+                  (.getCertificateChain src "localhost"))
+    (let [kmf (doto (javax.net.ssl.KeyManagerFactory/getInstance "PKIX") (.init ks (char-array "kp")))
+          {:keys [bytes pass]} (jolt.host/ref-get (first (.getKeyManagers kmf)) :material)
+          {:keys [key cert free]} (#'tls/parse-pkcs12 bytes pass)]
+      (try
+        (is (some? key) "the private key")
+        (is (some? cert) "and its certificate")
+        (finally (free))))))
 
 (deftest wrong-trust-store-password-is-an-error
   (is (thrown? Exception

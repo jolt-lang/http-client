@@ -73,7 +73,8 @@ require of ours could run.
 | `java.net.http.HttpClient` (JDK 11+) | `jolt.http.jdk` — client/request/response builders, `BodyPublishers`/`BodyHandlers`, `HttpHeaders`, over the same transport |
 | `java.net.http.WebSocket` | `jolt.http.websocket` — RFC 6455 client (handshake, frame codec, listener callbacks) |
 | `java.net.ProxySelector`, `Proxy`, `CookieManager`, `Authenticator` | real routing, not just constructors — see below |
-| `javax.net.ssl` (`SSLContext`, `SSLParameters`, trust managers, `KeyStore`) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the socket (`jolt.http.tls`), including PKCS#12 key and trust stores |
+| `javax.net.ssl` (`SSLContext`, `SSLParameters`, key and trust managers) | the system **OpenSSL** via `jolt.ffi`, memory-BIO TLS over the socket (`jolt.http.tls`), including PKCS#12 key and trust stores |
+| `java.security.KeyStore` (`PKCS12`) | a real PKCS#12 store that reads and writes what the JDK's does (`jolt.http.pkcs12`), see [KeyStore](#keystore) |
 | `java.io` byte streams, `java.io.SequenceInputStream` | jolt's own streams where it has them, shims where it does not |
 
 `java.util.zip` (gzip, deflate, raw deflate) is jolt's own, on the zlib every
@@ -156,6 +157,48 @@ after the `http.agent` property when that is set, and `Jolt-http-client/<version
 through `java.net.http`. A `User-Agent` the caller sets is sent instead. Some
 APIs' CDNs refuse a request with none.
 
+## KeyStore
+
+`KeyStore/getInstance "PKCS12"` is a working key store, not a carrier for bytes.
+It reads a PKCS#12 file the way the JDK's `PKCS12KeyStore` does, so the aliases
+come from each bag's friendlyName (lowercased), a key pairs with its certificate
+by localKeyID and its chain is built by issuer, and a certificate is a trusted
+entry only when it carries Oracle's trusted-key-usage attribute (what
+`keytool -importcert` writes, or `openssl pkcs12 -export -jdktrust
+anyExtendedKeyUsage`). Certificates are jolt-crypto's `X509Certificate` and keys
+its `PrivateKey`, and `getEncoded` on either gives the same bytes the JVM does
+for the same store.
+
+`load` (with a stream, or `nil` for an empty store), `aliases`, `containsAlias`,
+`size`, `isKeyEntry`, `isCertificateEntry`, `getCertificate`,
+`getCertificateChain`, `getKey`, `setKeyEntry`, `setCertificateEntry`,
+`deleteEntry` and `store` all work, and they fail with the JDK's exceptions and
+messages: a wrong store password is an `IOException` "keystore password was
+incorrect", a wrong key password an `UnrecoverableKeyException`, a store used
+before `load` a `KeyStoreException` "Uninitialized keystore". `store` writes
+what the JDK's `KeyStore` and `keytool -list` read back with the same aliases
+and entry kinds (checked on JDK 11, 21 and 25), in the JDK's own defaults:
+AES-256-CBC under PBKDF2 with HMAC-SHA256, a SHA-256 MAC, 10000 iterations.
+
+A store built or changed in memory works as an `:ssl-context` key or trust store
+too. The key and trust manager factories take its entries when they are
+initialised, as on the JDK. A store that was loaded and never changed reaches
+OpenSSL as the bytes it was loaded from, which is how it worked before
+`KeyStore` had entries of its own. One consequence differs from the JDK: a
+PKCS#12 holding only plain certificate bags, such as `openssl pkcs12 -export
+-nokeys` writes without `-jdktrust`, has no entries on the JDK but still serves
+here as a trust store of those certificates.
+
+Only `PKCS12` is a type. `JKS`, `JCEKS` and the rest throw `KeyStoreException`
+"`<type>` not found" (the JDK has providers for those). Secret-key entries, the
+`KeyStore.Builder`/`ProtectionParameter` forms, `getCreationDate` and
+`getCertificateAlias` are not implemented. Input that is not PKCS#12 at all is
+an `IOException`, where the JDK's DER parser may throw its `EOFException`
+subclass instead. A store whose certificates are under RC2-40, which OpenSSL 1.1
+and older JDKs wrote by default, needs OpenSSL 3's legacy provider; without it
+`load` fails with an `IOException` naming the cipher error rather than the
+password, since the MAC shows the password was right.
+
 ## Connections
 
 Connections are pooled and reused per origin. HTTP/1.1 is persistent by default,
@@ -222,7 +265,9 @@ leaves an arriving body alone.
   longer ships a libz shim of its own. (The earlier floor, 0.8.1, was
   `java.util.concurrent`'s executor interfaces, which
   `babashka.http-client`'s `->Executor` needs.)
-- OpenSSL (`libssl`/`libcrypto`) for https.
+- OpenSSL (`libssl`/`libcrypto`) for https. `KeyStore` needs OpenSSL 3.0 or
+  later: writing a trusted certificate entry uses `PKCS12_add1_attr_by_txt`,
+  which 3.0 added.
 
 ## Namespaces
 
@@ -233,6 +278,7 @@ leaves an arriving body alone.
 | `jolt.http.core` | the HTTP/1.1 engine: transport, URL parser, request/response codec — shared, so the two client surfaces cannot drift |
 | `jolt.http.net` | BSD sockets over `jolt.ffi` |
 | `jolt.http.tls` | OpenSSL, including PKCS#12 stores and `CONNECT`-tunnel wrapping |
+| `jolt.http.pkcs12` | PKCS#12 read and written by the JDK's rules, for `java.security.KeyStore` |
 | `jolt.http.platform` | `java.net.URL` / `HttpURLConnection` / byte streams / `java.util.zip`; requiring it installs everything |
 | `jolt.http.jdk` | `java.net.http` and the `java.net` / `javax.net.ssl` classes around it |
 | `jolt.http.websocket` | RFC 6455 |
@@ -249,6 +295,8 @@ jolt -M:test          # the HTTP/1.1 engine itself (jolt.http.core-test: URL
                       # clj-http-lite's own client, links and integration suites,
                       # vendored under test/clj_http/lite, with in-process
                       # plaintext + TLS servers in place of the Jetty subprocess
+                      # (and jolt.http.keystore-test: KeyStore against what
+                      # the JVM reports for the stores in test/resources/keystores)
 jolt -M:bhctest       # babashka.http-client, unmodified from Maven, over the
                       # java.net.http shim — request/response surface,
                       # interceptors, :async, multipart, proxy, cookies, auth
