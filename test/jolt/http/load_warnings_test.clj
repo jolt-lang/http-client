@@ -10,7 +10,7 @@
 
 (def ^:private library-namespaces
   '[jolt.http-client jolt.http.core jolt.http.jdk jolt.http.multipart
-    jolt.http.net jolt.http.platform jolt.http.tls jolt.http.websocket])
+    jolt.http.net jolt.http.pkcs12 jolt.http.platform jolt.http.tls jolt.http.websocket])
 
 ;; JOLT_PWD is set by CI, not by an interactive `jolt -M:test`
 (defn- project-dir []
