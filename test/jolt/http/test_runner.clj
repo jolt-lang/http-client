@@ -14,6 +14,7 @@
             [jolt.http.stream-shim-test]
             [jolt.http.core-test]
             [jolt.http.urlconnection-stream-test]
+            [jolt.http.sse-test]
             [jolt.http.user-agent-test]
             [jolt.http.client-options-test]
             [jolt.http.keystore-test]
@@ -30,6 +31,7 @@
                        'jolt.http.stream-shim-test
                        'jolt.http.core-test
                        'jolt.http.urlconnection-stream-test
+                       'jolt.http.sse-test
                        'jolt.http.user-agent-test
                        'jolt.http.client-options-test
                        'jolt.http.keystore-test
