@@ -285,6 +285,28 @@ leaves an arriving body alone.
   later: writing a trusted certificate entry uses `PKCS12_add1_attr_by_txt`,
   which the OpenSSL manual (PKCS12_add1_attr_by_NID(3)) says 3.0 added.
 
+## Server-sent events
+
+`jolt.http.sse` reads a `text/event-stream` body as events, by the WHATWG
+parsing rules, over `:as :stream`:
+
+```clojure
+(require '[jolt.http.sse :as sse])
+
+(def sub (sse/subscribe! {:url "http://localhost:3000/events"}
+                         {:on-event (fn [{:keys [event data id]}] (prn event data))
+                          :on-retry (fn [ms] ...)          ; the server's retry:
+                          :on-close (fn [{:keys [id error closed?]}] ...)}))
+((:close sub))     ; stop: aborts the read and drops the connection
+```
+
+`subscribe!` takes any request map (`:method`, `:body`, `:headers`), sends
+`Accept: text/event-stream` and, with `:last-event-id`, `Last-Event-ID`, and
+reads on a future. A reply that is not an event stream goes to `:on-response`
+instead. It reads one stream: reconnecting is the caller's policy, and
+`:on-close` hands over what a reconnect needs. `parse-line` and `parse-lines`
+are the parser alone, pure.
+
 ## Namespaces
 
 | | |
@@ -298,6 +320,7 @@ leaves an arriving body alone.
 | `jolt.http.platform` | `java.net.URL` / `HttpURLConnection` / byte streams / `java.util.zip`; requiring it installs everything |
 | `jolt.http.jdk` | `java.net.http` and the `java.net` / `javax.net.ssl` classes around it |
 | `jolt.http.websocket` | RFC 6455 |
+| `jolt.http.sse` | server-sent events: a `text/event-stream` body read as events |
 
 ## Tests
 
