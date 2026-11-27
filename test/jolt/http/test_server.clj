@@ -513,6 +513,15 @@
                        (str/trim (first (str/split p #","))))]
         (conn-write conn (latin1->ba (ws-accept-response key protocol)))
         (when (= uri "/greet") (ws-send! conn ws/op-text (.getBytes "hello from server" "UTF-8")))
+        ;; "€" (e2 82 ac) and "😀" (f0 9f 98 80) with each split across frames:
+        ;; a valid message whose fragments do not end on character boundaries.
+        (when (= uri "/split-utf8")
+          (doseq [[op fin? bs] [[ws/op-text false [0x61 0xe2]]
+                                [ws/op-continuation false [0x82 0xac 0xf0]]
+                                [ws/op-continuation false [0x9f 0x98]]
+                                [ws/op-continuation true [0x80 0x62]]]]
+            (conn-write conn (ws/encode-frame op (byte-array (map unchecked-byte bs))
+                                              {:mask? false :fin? fin?}))))
         (try
           (ws-echo-loop conn (latin1->ba (or body-raw "")))
           (catch Throwable _ nil)

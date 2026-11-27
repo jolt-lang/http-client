@@ -191,6 +191,24 @@
   (try (core/s-close (tget ws :stream)) (catch Throwable _ nil))
   nil)
 
+(defn- utf8-complete-length
+  "How many leading bytes of `ba` end on a UTF-8 character boundary: all of
+  them unless the last (at most three) bytes begin a sequence that needs more.
+  Bytes that are invalid anyway are left in, to decode as U+FFFD."
+  [ba]
+  (let [n (alength ba)]
+    (loop [i (dec n)]
+      (if (or (< i 0) (< i (- n 4)))
+        n
+        (let [b (ub ba i)]
+          (if (= 0x80 (bit-and b 0xc0))
+            (recur (dec i))
+            (let [need (cond (= 0xc0 (bit-and b 0xe0)) 2
+                             (= 0xe0 (bit-and b 0xf0)) 3
+                             (= 0xf0 (bit-and b 0xf8)) 4
+                             :else 1)]
+              (if (< (- n i) need) i n))))))))
+
 (defn- reader-loop [ws listener leftover]
   (let [stream (tget ws :stream)
         ;; A read appends to the buffer and decoding advances an offset through
@@ -203,7 +221,9 @@
                    [(core/concat-bas [(core/sub-ba buf off (alength buf)) chunk]) 0]))]
     (loop [buf leftover
            off 0
-           frag {:opcode nil :parts []}]
+           ;; :pending holds the bytes of a character a text fragment split
+           ;; off, prepended to the next fragment (jolt-lang/http-client#51)
+           frag {:opcode nil :pending nil}]
       (if-let [[frame next-off] (decode-frame-at buf off)]
         (let [{:keys [opcode fin? payload]} frame]
           (cond
@@ -237,11 +257,17 @@
             ;; text/binary/continuation. The JDK hands each fragment to the
             ;; listener with `last`, so the message type of a continuation is
             ;; the type of the frame that opened it.
-            (let [kind (if (= opcode op-continuation) (:opcode frag) opcode)]
-              (if (= kind op-text)
-                (safely ws listener (.onText listener ws (String. payload "UTF-8") fin?))
-                (safely ws listener (.onBinary listener ws (java.nio.ByteBuffer/wrap payload) fin?)))
-              (recur buf next-off (if fin? {:opcode nil :parts []} {:opcode kind :parts []})))))
+            (let [kind (if (= opcode op-continuation) (:opcode frag) opcode)
+                  pending (if (= kind op-text)
+                            (let [bs (if-let [p (:pending frag)] (core/concat-ba p payload) payload)
+                                  n (if fin? (alength bs) (utf8-complete-length bs))]
+                              (safely ws listener
+                                      (.onText listener ws (String. (if (= n (alength bs)) bs (core/sub-ba bs 0 n)) "UTF-8") fin?))
+                              (when (< n (alength bs)) (core/sub-ba bs n (alength bs))))
+                            (do (safely ws listener
+                                        (.onBinary listener ws (java.nio.ByteBuffer/wrap payload) fin?))
+                                nil))]
+              (recur buf next-off (if fin? {:opcode nil :pending nil} {:opcode kind :pending pending})))))
         ;; incomplete frame: read more
         (let [chunk (try (core/s-read stream nil)
                          (catch Throwable t

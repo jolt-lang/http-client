@@ -128,6 +128,15 @@
     (is (= [false true] (mapv #(nth % 2) @msgs)))
     (ws/close! sock)))
 
+(deftest text-fragments-split-a-character
+  ;; jolt-lang/http-client#51: a fragment can end mid-character; the incomplete
+  ;; bytes carry over to the next fragment instead of decoding to U+FFFD.
+  (let [{:keys [msgs done on-message]} (collector 4)]
+    (ws/websocket {:uri (str base "/split-utf8") :on-message on-message})
+    (await! done)
+    (is (= "a\u20ac\ud83d\ude00b" (apply str (map second @msgs))))
+    (is (= [false false false true] (mapv #(nth % 2) @msgs)))))
+
 (deftest ping-gets-a-pong
   (let [pong (promise)
         sock (ws/websocket {:uri base :on-pong (fn [_ _] (deliver pong true))})]
